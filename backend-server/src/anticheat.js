@@ -118,6 +118,14 @@ const SYNDICATE_SIMILARITY_THRESHOLD = 0.9;
  *   PIXEL_PERFECT_TOUCH      25
  *   INHUMAN_SCROLL_SPEED     20
  *   TOO_FEW_SAMPLES         100  -> always 0; not enough evidence to pass
+ *   BATTERY_NOT_REPORTED      0  -> INFORMATIONAL ONLY, never a deduction
+ *
+ * `BATTERY_NOT_REPORTED` is the one flag whose presence must not cost a single
+ * point. See the CASE (ii) reasoning in `evaluateTelemetry`: `battery_plus` 7.x
+ * exposes no temperature API, so `batteryTempC: null` is what a large and
+ * legitimate slice of real Android devices actually sends. Charging them for it
+ * would be a false positive, so the flag exists purely to make the state
+ * observable in the audit trail — it carries information, not a penalty.
  *
  * @type {Record<string, number>}
  */
@@ -127,7 +135,9 @@ const FLAGS_PENALTIES = Object.freeze({
   PIXEL_PERFECT_TOUCH: 25,
   INHUMAN_SCROLL_SPEED: 20,
   TOO_FEW_SAMPLES: 100,
+  BATTERY_NOT_REPORTED: 0,
 });
+
 
 /* -------------------------------------------------------------------------- */
 /* Flag constants                                                              */
@@ -139,6 +149,7 @@ const FLAGS_PENALTIES = Object.freeze({
  * @type {Readonly<{
  *   BATTERY_FLATLINE: string,
  *   BATTERY_IMPOSSIBLE: string,
+ *   BATTERY_NOT_REPORTED: string,
  *   PIXEL_PERFECT_TOUCH: string,
  *   INHUMAN_SCROLL_SPEED: string,
  *   TOO_FEW_SAMPLES: string
@@ -147,8 +158,23 @@ const FLAGS_PENALTIES = Object.freeze({
 const FLAGS = Object.freeze({
   /** Battery temperature never moves across the whole sample window. */
   BATTERY_FLATLINE: "BATTERY_FLATLINE",
-  /** Battery temperature outside 10..60C, missing, or non-numeric (also: missing ts). */
+  /**
+   * Battery temperature outside 10..60C, a value of the wrong TYPE entirely
+   * (string / boolean / object / NaN / Infinity), or a missing/non-finite `ts`.
+   *
+   * NOTE (deliberate): this used to also cover a MISSING `batteryTempC`. It no
+   * longer does. A device with no temperature API sends `null`, and that is
+   * absence of evidence, not evidence of cheating.
+   */
   BATTERY_IMPOSSIBLE: "BATTERY_IMPOSSIBLE",
+  /**
+   * No sample in the session carried a temperature at all: the hardware does
+   * not expose the API. INFORMATIONAL ONLY — penalty 0 by design, so it never
+   * changes the score or the accept/reject verdict. It exists so the state is
+   * visible in the stored telemetry and on the ops dashboard instead of being
+   * silently invisible.
+   */
+  BATTERY_NOT_REPORTED: "BATTERY_NOT_REPORTED",
   /** The exact same touch coordinate landed at least twice. */
   PIXEL_PERFECT_TOUCH: "PIXEL_PERFECT_TOUCH",
   /** Implied scroll velocity exceeded SCROLL_MAX_PX_PER_SECOND. */
@@ -156,6 +182,83 @@ const FLAGS = Object.freeze({
   /** Fewer than MIN_TELEMETRY_SAMPLES records: insufficient evidence to trust. */
   TOO_FEW_SAMPLES: "TOO_FEW_SAMPLES",
 });
+
+/* -------------------------------------------------------------------------- */
+/* Disqualifying flags — the flag is the gate, not the arithmetic              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Policy switch for the disqualifying-flag rule below. Exported so the policy
+ * is explicit in code review and reversible in one edit, without touching a
+ * penalty value.
+ *
+ * Setting this to `false` restores the pre-policy behaviour exactly: the score
+ * becomes the sole verdict again and a lone `BATTERY_FLATLINE` (100 - 40 = 60)
+ * passes, because `isTelemetryAcceptable` compares with `>=`.
+ *
+ * WHEN TO REVISIT IT: once real telemetry distributions have been collected
+ * from production devices, the false-positive rate of the flatline rule can be
+ * measured rather than assumed, and this constant flipped on the evidence.
+ * That review is a PRD Mainnet Gate, not a code comment.
+ *
+ * @type {boolean}
+ */
+const FLATLINE_DISQUALIFIES = true;
+
+/**
+ * Flags that make a session UNACCEPTABLE on their own, regardless of score.
+ *
+ * WHY THIS EXISTS, stated as arithmetic rather than taste. `BATTERY_FLATLINE`
+ * is -40 against a pristine 100 and `TELEMETRY_PASS_SCORE` is 60, and
+ * `isTelemetryAcceptable` used `score >= 60`. A lone flatline therefore landed
+ * on EXACTLY 60 and was ACCEPTED: the emulator-detection backbone was
+ * decorative for the single most forgeable signal in the system. Every other
+ * battery signal is defensible as a deduction, but a temperature which never
+ * moves across an entire reading session is not a weak signal that a good
+ * device might produce — it is the signature of a stubbed sensor. Real
+ * hardware drifts, which is exactly what the flag already detects; the missing
+ * piece was the DECISION, not the detection.
+ *
+ * THE SCORE IS NOT REMOVED. `evaluateTelemetry` still reports `score: 60` and
+ * the flag, so the audit trail and the ops dashboard are unchanged and an
+ * offline re-score of a disputed claim still produces the same number. The
+ * score simply stopped being the verdict.
+ *
+ * WHY ONLY THIS ONE FLAG. The set is deliberately a single entry:
+ *   - `BATTERY_IMPOSSIBLE` (-30 -> 70) is a wrong-typed or out-of-range value,
+ *     which is a modified client rather than a fingerprint; it stays a
+ *     deduction.
+ *   - `PIXEL_PERFECT_TOUCH` (-25 -> 75) and `INHUMAN_SCROLL_SPEED` (-20 -> 80)
+ *     are individually survivable BY DESIGN and Wave 7 pins that economy.
+ *     Promoting either would be an unauthorised protocol-wide change.
+ *   - `BATTERY_NOT_REPORTED` (0) MUST NEVER APPEAR HERE — see the neutrality
+ *     argument below, which is a hard constraint, not a preference.
+ *
+ * THE WAVE-7 NEUTRALITY RULE IS NOT REGRESSED BY THIS. A device with no
+ * temperature API sends `batteryTempC: null` on every sample, which takes
+ * `evaluateTelemetry` down the CASE (ii) branch: it raises
+ * `BATTERY_NOT_REPORTED` and NEVER `BATTERY_FLATLINE` (a run of identical
+ * NULLS is missing data, not a frozen sensor). So incapable hardware can never
+ * reach this set and is never disqualified. The flatline rule can only ever
+ * fire against a device that reported at least one plausible reading and then
+ * stopped drifting. Adding `BATTERY_NOT_REPORTED` here would ban every
+ * sensor-less phone in the fleet and is asserted against in
+ * test/red-team.test.js.
+ *
+ * THE FALSE POSITIVE, STATED HONESTLY AND ACCEPTED. A genuinely stuck or
+ * heavily OS-throttled thermal sensor on an otherwise capable device will be
+ * REJECTED and will never be paid, with no appeal path other than a support
+ * ticket. That is a real cost to a small number of real users. It is accepted
+ * as the cost of emulator detection, because the alternative — a farm of
+ * stubbed sensors that reads a perfect 60 and is indistinguishable from honest
+ * hardware — is a systemic loss, and the two are not symmetric. The exposure is
+ * bounded to sessions that report at least one plausible temperature and then
+ * hold it, which is a narrow slice, and the size of that slice is exactly what
+ * the Mainnet Gate review above is meant to measure.
+ *
+ * @type {ReadonlySet<string>}
+ */
+const DISQUALIFYING_FLAGS = new Set([FLAGS.BATTERY_FLATLINE]);
 
 /**
  * Submission flags raised by `evaluateSubmission`.
@@ -266,16 +369,74 @@ function _tokenize(text) {
  * Detection summary:
  *   - BATTERY_FLATLINE: fewer than two plausible temperature readings, or
  *     every plausible reading identical within BATTERY_FLATLINE_EPSILON. Real
- *     hardware drifts.
- *   - BATTERY_IMPOSSIBLE: a temperature outside 10..60C, missing, NaN or
- *     non-numeric, or a missing/non-finite `ts`.
+ *     hardware drifts. Only ever raised for a session that reported at least
+ *     one temperature.
+ *   - BATTERY_IMPOSSIBLE: a temperature outside 10..60C, a value of the wrong
+ *     type entirely (string, boolean, object, NaN, Infinity), or a
+ *     missing/non-finite `ts`. NOT raised for a null/absent `batteryTempC`.
+ *   - BATTERY_NOT_REPORTED: no sample carried a temperature at all. Penalty 0.
  *   - PIXEL_PERFECT_TOUCH: the same (x, y) pair appearing at least twice.
  *   - INHUMAN_SCROLL_SPEED: |scrollDelta| / dtSeconds above
  *     SCROLL_MAX_PX_PER_SECOND, using the signed per-interval delta.
  *   - TOO_FEW_SAMPLES: fewer than MIN_TELEMETRY_SAMPLES records.
  *
- * @param {Array<{ ts: number, batteryTempC: number, touch: { x: number, y: number }, scrollDelta: number }>} samples
- *   Telemetry records in chronological order.
+ * BATTERY TEMPERATURE, THE THREE CASES (the app guarantees the `batteryTempC`
+ * key is always present, as either a finite number or `null`):
+ *
+ *   (i) CAPABLE DEVICE — at least one sample carries a number. The session is
+ *       treated as capable and the flatline/impossible checks apply to the
+ *       samples that do have values. Real drifting data costs nothing. A
+ *       frozen sensor costs exactly the documented -40, which puts a LONE
+ *       flatline on 60 — the pre-existing "one major signal survives" boundary
+ *       (see FLAGS_PENALTIES) — and any second signal takes it off. Both the
+ *       -40 and the 60 are pinned by contract, so a lone flatline is
+ *       deliberately left acceptable rather than silently re-tuned here.
+ *   (ii) NO SENSOR — every sample is `null`/absent. NEUTRAL: no penalty, no
+ *       bonus, and specifically never BATTERY_FLATLINE ("identical" across
+ *       nulls is an absence of data, not the signature of an emulator) and
+ *       never BATTERY_IMPOSSIBLE. `battery_plus` 7.x has no temperature API, so
+ *       `null` is what a large share of real, low-end Android hardware
+ *       genuinely sends. Absence of evidence is not evidence of cheating: the
+ *       old behaviour docked every one of those honest users 30 points for the
+ *       crime of owning an old phone. The state is still surfaced as
+ *       BATTERY_NOT_REPORTED, which is observable but worth exactly 0 points.
+ *   (iii) MIXED — some numbers, some nulls. Resolved as "capable", NOT as
+ *       "incomplete". Rationale, stated as an anti-gaming argument: a cheater
+ *       who reports a constant temperature wants the flatline check to go
+ *       away, and the only way to do that is to stop supplying evidence. If
+ *       nulls could cancel out a flatline, a cheater could sprinkle
+ *       `batteryTempC: null` into their fake stream and switch the battery
+ *       signal off entirely. So nulls are IGNORED for detection purposes
+ *       (never counted as readings, never penalised) and can therefore only
+ *       ever leave the check ON: a capable session still needs at least two
+ *       plausible, mutually-differing readings to clear BATTERY_FLATLINE, and
+ *       nulls do not supply them. A cheater who sprinkles nulls makes the
+ *       battery signal STRICTER against themselves, never weaker.
+ *
+ *   Consequence, stated plainly rather than papered over: an all-null session
+ *   and an honest capable session that passes cleanly score the SAME number.
+ *   That equality is the whole point — no bonus for reporting data, because a
+ *   bonus is worth farming and would make "report nothing" strictly better than
+ *   "be honest". What the all-null session does not get is silence: it is
+ *   tagged BATTERY_NOT_REPORTED in the stored telemetry, and it still has to
+ *   clear PIXEL_PERFECT_TOUCH, INHUMAN_SCROLL_SPEED and TOO_FEW_SAMPLES.
+ *
+ * MALFORMED vs ABSENT (why there is no separate flag for a wrong-typed
+ * `batteryTempC`): a number outside 10..60C and a value like the string "29",
+ * `NaN`, `true` or `{}` are the same class of claim — a battery temperature
+ * that no real device could emit. `battery_plus` and the MethodChannel both
+ * produce a finite number or null and nothing else, so a wrong-typed value is
+ * fabrication from a modified client, exactly like an impossible reading.
+ * It is therefore folded into the existing BATTERY_IMPOSSIBLE flag and its
+ * existing -30 penalty rather than given a new flag: the detection is
+ * identical, and a new flag would only have duplicated the deduction.
+ * A missing or non-finite `ts` stays folded in here for the same reason — it
+ * is the same fabrication, and the comment at the call site says so.
+ *
+ * @param {Array<{ ts: number, batteryTempC: number|null, touch: { x: number, y: number }, scrollDelta: number }>} samples
+ *   Telemetry records in chronological order. `batteryTempC` is a finite
+ *   number or null; null means the hardware has no temperature API and is
+ *   scored neutrally (see the case analysis above).
  * @returns {{ score: number, flags: Array<string> }} Score 0..100 (100 = pristine)
  *   plus the flags that were raised.
  * @throws {TypeError} If `samples` is not an array.
@@ -297,6 +458,10 @@ function evaluateTelemetry(samples) {
 
   // --- Per-record plausibility ---------------------------------------------
   let impossible = false;
+  // True once any sample has produced a usable, in-range temperature. This is
+  // the CAPABILITY bit: the session is only held to the battery checks if the
+  // hardware actually reported something at least once.
+  let reportedAny = false;
   const temperatures = [];
   const seenTouches = new Set();
   let repeatedTouch = false;
@@ -313,10 +478,29 @@ function evaluateTelemetry(samples) {
       impossible = true;
     }
 
-    if (!_isFiniteNumber(temp) || temp < BATTERY_MIN_PLAUSIBLE_C || temp > BATTERY_MAX_PLAUSIBLE_C) {
+    if (temp === null || temp === undefined) {
+      // CASE (ii)/(iii): the sample carries no reading. Deliberately a no-op
+      // here — absence is neither a reading nor a fault. The whole-session
+      // decision is taken after this loop, because whether "no reading" is
+      // neutral (a phone with no sensor) or suspicious (a capable device that
+      // went quiet) depends on the OTHER samples in the same session.
+      // `undefined` is treated exactly like `null` because JSON cannot express
+      // it: over the wire an absent key and a null are the same thing.
+    } else if (!_isFiniteNumber(temp)) {
+      // CASE (i), MALFORMED: the right field with a value no real sensor emits
+      // (string, boolean, object, NaN, Infinity). Same class of fabrication as
+      // an impossible reading, so it carries the same flag and the same -30.
       impossible = true;
+      reportedAny = true; // a number WAS attempted, so the device is capable
     } else {
-      temperatures.push(temp);
+      // A real reading. Out of range means the value itself is not a phone
+      // battery; in range it counts as evidence of capability.
+      reportedAny = true;
+      if (temp < BATTERY_MIN_PLAUSIBLE_C || temp > BATTERY_MAX_PLAUSIBLE_C) {
+        impossible = true;
+      } else {
+        temperatures.push(temp);
+      }
     }
 
     const touch = record.touch;
@@ -329,14 +513,22 @@ function evaluateTelemetry(samples) {
     }
   }
 
-  // --- Flatline -------------------------------------------------------------
-  // Requires at least two readings: a single reading trivially has zero
-  // spread and would otherwise flag every short-but-valid stream.
+  // --- Battery verdict, once the whole session is known --------------------
   let flatline = false;
-  if (temperatures.length < 2) {
-    // A session that produced fewer than two plausible readings has a dead or
-    // stubbed sensor, not a battery that happens to be steady. Flagged as a
-    // flatline because that is the honest description of the signal.
+  let notReported = false;
+  if (!reportedAny) {
+    // CASE (ii): the device exposes no temperature API. NEUTRAL, explicitly:
+    // no flatline (a run of identical NULLS is missing data, not a frozen
+    // sensor — flagging it here is exactly the false positive that made every
+    // low-end Android user look like a farm), no impossible reading, no
+    // penalty. BATTERY_NOT_REPORTED records the state at zero cost.
+    notReported = samples.length > 0;
+  } else if (temperatures.length < 2) {
+    // CASE (i)/(iii): capable, but fewer than two plausible readings — a dead
+    // or stubbed sensor, not a battery that happens to be steady. Flagged as a
+    // flatline because that is the honest description of the signal, and
+    // because it is the reason sprinkling nulls cannot buy an escape: nulls
+    // are not readings, so they can only keep this check armed, never disarm it.
     flatline = samples.length > 0;
   } else {
     let min = temperatures[0];
@@ -375,11 +567,14 @@ function evaluateTelemetry(samples) {
 
   if (flatline) flags.push(FLAGS.BATTERY_FLATLINE);
   if (impossible) flags.push(FLAGS.BATTERY_IMPOSSIBLE);
+  if (notReported) flags.push(FLAGS.BATTERY_NOT_REPORTED);
   if (repeatedTouch) flags.push(FLAGS.PIXEL_PERFECT_TOUCH);
   if (inhumanScroll) flags.push(FLAGS.INHUMAN_SCROLL_SPEED);
 
   let score = 100;
   for (const flag of flags) {
+    // BATTERY_NOT_REPORTED is present in the table with an explicit 0 so the
+    // cost of "no temperature" is written down, not left to a default.
     score -= FLAGS_PENALTIES[flag] !== undefined ? FLAGS_PENALTIES[flag] : 0;
   }
 
@@ -389,13 +584,41 @@ function evaluateTelemetry(samples) {
 /**
  * Convenience gate for the submission path: did the telemetry clear the bar?
  *
+ * THE GATE IS THE FLAG SET, NOT THE ARITHMETIC. Two rules, in this order:
+ *
+ *   1. DISQUALIFYING FLAGS FAIL FIRST, REGARDLESS OF SCORE. Any flag in
+ *      `DISQUALIFYING_FLAGS` (see the long comment there — today exactly
+ *      `BATTERY_FLATLINE`) makes the session unacceptable on its own. This is
+ *      checked before the score on purpose: it is the only ordering that makes
+ *      the rule meaningful, because a disqualifying flag is by definition a
+ *      signal strong enough to reject on its own. The score is still computed
+ *      and still reported by `evaluateTelemetry`; it is simply no longer the
+ *      verdict.
+ *   2. OTHERWISE THE SCORE DECIDES, unchanged: `score >= TELEMETRY_PASS_SCORE`.
+ *      Every deduction, every threshold and every "one major signal survives"
+ *      boundary in `FLAGS_PENALTIES` behaves exactly as before.
+ *
+ * The switch is `FLATLINE_DISQUALIFIES`, so setting it to `false` reverts this
+ * function to its previous behaviour with no other edit.
+ *
  * @param {{ score: number, flags: Array<string> }|null|undefined} result
  *   Result of `evaluateTelemetry`. Anything non-conforming is unacceptable.
- * @returns {boolean} True only when the score reaches TELEMETRY_PASS_SCORE.
+ * @returns {boolean} True only when the score reaches TELEMETRY_PASS_SCORE AND
+ *   no disqualifying flag is present.
  */
 function isTelemetryAcceptable(result) {
   if (!result || typeof result !== "object") {
     return false;
+  }
+  if (FLATLINE_DISQUALIFIES) {
+    const flags = result.flags;
+    if (Array.isArray(flags)) {
+      for (const flag of flags) {
+        if (DISQUALIFYING_FLAGS.has(flag)) {
+          return false;
+        }
+      }
+    }
   }
   return _isFiniteNumber(result.score) && result.score >= TELEMETRY_PASS_SCORE;
 }
@@ -656,6 +879,9 @@ module.exports = {
   MIN_TYPING_MS_PER_CHAR,
   SYNDICATE_SIMILARITY_THRESHOLD,
   FLAGS_PENALTIES,
+  // Disqualifying-flag policy (see the long comment above the constant)
+  FLATLINE_DISQUALIFIES,
+  DISQUALIFYING_FLAGS,
   // Flag constants
   FLAGS,
   SUBMISSION_FLAGS,

@@ -18,6 +18,8 @@ const {
   FLAGS,
   SUBMISSION_FLAGS,
   FLAGS_PENALTIES,
+  FLATLINE_DISQUALIFIES,
+  DISQUALIFYING_FLAGS,
   STATUS,
   PASS,
   FAIL,
@@ -154,6 +156,65 @@ function botTouchTelemetry(count = 30) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Battery-temperature fixtures — one per documented case                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * CASE (ii) — a device whose hardware exposes NO battery-temperature API.
+ * `battery_plus` 7.x is exactly this case, so on a real low-end Android phone
+ * every sample legitimately carries `batteryTempC: null`. Everything else is
+ * the untouched human fixture, so any flag raised here is attributable to the
+ * temperature alone.
+ *
+ * @param {number} [count]
+ * @returns {Array<Object>} Samples whose every `batteryTempC` is null.
+ */
+function noTemperatureTelemetry(count = 30) {
+  return humanTelemetry(count).map((sample) => ({ ...sample, batteryTempC: null }));
+}
+
+/**
+ * CASE (i), FLATLINE — a CAPABLE device reporting a real sensor that is stuck
+ * on one constant. Touch and scroll are the human fixture's, so the battery
+ * signal is the only thing wrong with it.
+ *
+ * @param {number} [count]
+ * @param {number} [temp] The stuck reading, in degrees C.
+ * @returns {Array<Object>} Samples with an identical, plausible temperature.
+ */
+function flatlineTemperatureTelemetry(count = 30, temp = 31.5) {
+  return humanTelemetry(count).map((sample) => ({ ...sample, batteryTempC: temp }));
+}
+
+/**
+ * CASE (i), IMPOSSIBLE — a CAPABLE device reporting a value no phone battery
+ * can hold (or a value of the wrong type). Only the flagged sample is touched,
+ * so the rest of the run still supplies drifting evidence.
+ *
+ * @param {number} [count]
+ * @param {unknown} [badTemp] The value to inject at sample 3.
+ * @returns {Array<Object>} Samples with one impossible battery reading.
+ */
+function impossibleTemperatureTelemetry(count = 30, badTemp = 90) {
+  return humanTelemetry(count).map((sample, i) => (i === 3 ? { ...sample, batteryTempC: badTemp } : sample));
+}
+
+/**
+ * CASE (iii), MIXED — a CAPABLE device whose client only forwards the reading
+ * on some samples (a MethodChannel call that races the sampler, a permission
+ * that comes and goes). `null` on every third sample, real drifting numbers
+ * elsewhere.
+ *
+ * @param {number} [count]
+ * @returns {Array<Object>} Samples with alternating real and null readings.
+ */
+function mixedTemperatureTelemetry(count = 30) {
+  return humanTelemetry(count).map((sample, i) =>
+    i % 3 === 0 ? { ...sample, batteryTempC: null } : sample
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /* 1. Telemetry                                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -184,13 +245,315 @@ test("emulator telemetry: BATTERY_FLATLINE and PIXEL_PERFECT_TOUCH, below the th
   assert.equal(result.score, 100 - FLAGS_PENALTIES.BATTERY_FLATLINE - FLAGS_PENALTIES.PIXEL_PERFECT_TOUCH);
 });
 
-test("emulator with no battery sensor at all: never acceptable", () => {
-  const samples = humanTelemetry().map((sample) => ({ ...sample, batteryTempC: undefined }));
+/* -------------------------------------------------------------------------- */
+/* 1b. Battery temperature — the three documented cases                         */
+/* -------------------------------------------------------------------------- */
+
+test("CASE (i) CAPABLE + FLATLINE: a stuck real sensor costs exactly the full -40", () => {
+  const samples = flatlineTemperatureTelemetry();
+  // Fixture guard: the run must be long enough and clean on every other axis,
+  // or the assertions below would not be about the battery at all.
+  assert.ok(samples.length > MIN_TELEMETRY_SAMPLES);
+  assert.equal(new Set(samples.map((s) => `${s.touch.x}|${s.touch.y}`)).size, samples.length);
+
   const result = evaluateTelemetry(samples);
-  assert.ok(result.flags.includes(FLAGS.BATTERY_IMPOSSIBLE), "a missing reading is impossible");
-  assert.ok(result.flags.includes(FLAGS.BATTERY_FLATLINE), "a dead sensor is a flatline");
-  assert.ok(result.score < TELEMETRY_PASS_SCORE);
-  assert.equal(isTelemetryAcceptable(result), false);
+  assert.ok(result.flags.includes(FLAGS.BATTERY_FLATLINE), `expected a flatline, got ${result.flags}`);
+  assert.ok(!result.flags.includes(FLAGS.BATTERY_IMPOSSIBLE), "31.5C is physically plausible");
+  assert.ok(!result.flags.includes(FLAGS.BATTERY_NOT_REPORTED), "this device clearly has a sensor");
+  // Exact deduction: the ONLY flag raised is the flatline, so the score is
+  // 100 - 40 = 60.
+  assert.deepEqual(result.flags, [FLAGS.BATTERY_FLATLINE]);
+  assert.equal(result.score, 100 - FLAGS_PENALTIES.BATTERY_FLATLINE);
+  assert.equal(result.score, 60);
+
+  // HONEST BOUNDARY, not an accident of this change: 60 is exactly
+  // TELEMETRY_PASS_SCORE, and the engine has always been calibrated so that
+  // ONE major signal survives (see the FLAGS_PENALTIES table: "survives alone
+  // (60)"). Making a lone flatline fail would need either a penalty above 40
+  // or a pass bar below 60, and both numbers are pinned by contract. So the
+  // assertion here is the detection, the exact deduction, and the fact that
+  // the flatline is the flag that put the session ON the bar — one more signal
+  // and it is off, which is asserted next.
+  assert.equal(result.score, TELEMETRY_PASS_SCORE);
+
+  // POLICY GATE, changed by the red-team wave. The DETECTION and the EXACT
+  // DEDUCTION above are unchanged and still asserted: the flag is raised and
+  // the score is still 100 - 40 = 60, which is still exactly
+  // TELEMETRY_PASS_SCORE. What changed is the DECISION.
+  //
+  // Previously `isTelemetryAcceptable` compared the score with `>=`, so a lone
+  // flatline landed on 60 and was ACCEPTED — the emulator-detection backbone
+  // was decorative for the most forgeable signal in the system. The verdict is
+  // now gated on the FLAG: BATTERY_FLATLINE is in `DISQUALIFYING_FLAGS` and
+  // rejects regardless of score. The score is still computed and still reported
+  // (asserted immediately above), so the audit trail and any offline re-score
+  // are unaffected; only the accept/reject decision moved.
+  assert.equal(
+    isTelemetryAcceptable(result),
+    false,
+    "a lone flatline is DISQUALIFYING by flag, even though its score still lands exactly on the pass bar"
+  );
+  assert.ok(
+    DISQUALIFYING_FLAGS.has(FLAGS.BATTERY_FLATLINE),
+    "and the policy is an exported set, so it is auditable and reversible via FLATLINE_DISQUALIFIES"
+  );
+  assert.ok(result.score < 100, "it did cost something");
+
+  // One more signal and the same farm is rejected outright: 100 - 40 - 25.
+  const withTouch = evaluateTelemetry(samples.map((s) => ({ ...s, touch: { x: 412, y: 883 } })));
+  assert.ok(withTouch.flags.includes(FLAGS.BATTERY_FLATLINE));
+  assert.equal(withTouch.score, 100 - FLAGS_PENALTIES.BATTERY_FLATLINE - FLAGS_PENALTIES.PIXEL_PERFECT_TOUCH);
+  assert.ok(withTouch.score < TELEMETRY_PASS_SCORE);
+  assert.equal(isTelemetryAcceptable(withTouch), false, "flatline + any other signal is unacceptable");
+
+  // And the same is true through the real farm shape the engine is aimed at
+  // (constant temperature AND a replayed tap), which is what the pre-existing
+  // emulator fixture is: 35.
+  const farm = evaluateTelemetry(emulatorTelemetry());
+  assert.ok(farm.flags.includes(FLAGS.BATTERY_FLATLINE));
+  assert.ok(farm.score < TELEMETRY_PASS_SCORE);
+  assert.equal(isTelemetryAcceptable(farm), false);
+});
+
+test("CASE (i) CAPABLE + FLATLINE within epsilon still flags; drift beyond it does not", () => {
+  const jitter = evaluateTelemetry(flatlineTemperatureTelemetry(30, 31.5 + 0.005));
+  assert.ok(jitter.flags.includes(FLAGS.BATTERY_FLATLINE), "inside the epsilon it is still flat");
+
+  const drifting = evaluateTelemetry(
+    humanTelemetry(30).map((sample, i) => ({ ...sample, batteryTempC: Number((31.5 + i * 0.005).toFixed(4)) }))
+  );
+  assert.ok(!drifting.flags.includes(FLAGS.BATTERY_FLATLINE), "0.145C of spread is real drift");
+  assert.equal(drifting.score, 100);
+});
+
+test("CASE (i) CAPABLE + IMPOSSIBLE: out-of-range and wrong-typed values both raise BATTERY_IMPOSSIBLE", () => {
+  for (const badTemp of [5, -40, 90, 61, 9.9]) {
+    const result = evaluateTelemetry(impossibleTemperatureTelemetry(30, badTemp));
+    assert.ok(
+      result.flags.includes(FLAGS.BATTERY_IMPOSSIBLE),
+      `batteryTempC ${badTemp} must be impossible, got ${result.flags}`
+    );
+    assert.ok(!result.flags.includes(FLAGS.BATTERY_FLATLINE), "the other 29 samples still drift");
+    assert.ok(!result.flags.includes(FLAGS.BATTERY_NOT_REPORTED));
+    assert.equal(result.score, 100 - FLAGS_PENALTIES.BATTERY_IMPOSSIBLE);
+    assert.ok(result.score > 0);
+    // 70 is the pre-existing "survives alone (70)" boundary, unchanged here.
+    // What matters for this fix is that the reading is still CAUGHT: the flag
+    // is raised and the full -30 is charged, on a device that also reports
+    // temperature normally on the other 29 samples.
+    assert.equal(result.score, 100 - FLAGS_PENALTIES.BATTERY_IMPOSSIBLE);
+    // Impossible on every sample of a capable device: caught twice over, 30.
+    const every = evaluateTelemetry(flatlineTemperatureTelemetry(30, 90));
+    assert.deepEqual(every.flags, [FLAGS.BATTERY_FLATLINE, FLAGS.BATTERY_IMPOSSIBLE]);
+    assert.equal(every.score, 30);
+    assert.equal(isTelemetryAcceptable(every), false);
+  }
+});
+
+test("CASE (i) MALFORMED values (string, NaN, boolean, object) are treated as BATTERY_IMPOSSIBLE", () => {
+  // The app guarantees `number | null`. Anything else is a modified client, the
+  // same fabrication class as an impossible reading, so it carries the same
+  // flag and the same -30. Documented in src/anticheat.js.
+  for (const badTemp of ["29", "", NaN, Infinity, -Infinity, true, false, {}, [], new Date(0)]) {
+    const result = evaluateTelemetry(impossibleTemperatureTelemetry(30, badTemp));
+    assert.ok(
+      result.flags.includes(FLAGS.BATTERY_IMPOSSIBLE),
+      `batteryTempC ${String(badTemp)} must be impossible, got ${result.flags}`
+    );
+    assert.equal(result.score, 100 - FLAGS_PENALTIES.BATTERY_IMPOSSIBLE);
+  }
+});
+
+test("CASE (i) CAPABLE + REAL VARYING TEMPERATURE: no battery flags, no penalty, acceptable", () => {
+  const samples = humanTelemetry(); // the drifting 25..40C human fixture
+  const result = evaluateTelemetry(samples);
+  assert.deepEqual(result.flags, [], `a real sensor must be free, got ${result.flags}`);
+  assert.equal(result.score, 100);
+  assert.equal(isTelemetryAcceptable(result), true);
+
+  // Real data is never treated worse than no data: it beats the flatline, and
+  // it ties the sensor-less session (which is allowed, because "no data" is
+  // penalised at zero, not rewarded).
+  const flatlined = evaluateTelemetry(flatlineTemperatureTelemetry());
+  assert.ok(result.score >= flatlined.score, "real drift must never score below a flatline");
+  assert.equal(result.score, evaluateTelemetry(noTemperatureTelemetry()).score);
+});
+
+test("CASE (ii) NO TEMPERATURE AT ALL: neutral, zero deduction, never a flatline", () => {
+  const samples = noTemperatureTelemetry();
+  const result = evaluateTelemetry(samples);
+
+  // The three things that must NOT happen.
+  assert.ok(!result.flags.includes(FLAGS.BATTERY_FLATLINE), "identical NULLS are absent data, not a stuck sensor");
+  assert.ok(!result.flags.includes(FLAGS.BATTERY_IMPOSSIBLE), "no sensor is not an impossible reading");
+  // ...and the state is still observable.
+  assert.ok(result.flags.includes(FLAGS.BATTERY_NOT_REPORTED), `expected NOT_REPORTED, got ${result.flags}`);
+
+  // ZERO POINTS, neither a penalty nor a bonus: identical to the score of the
+  // same session with a real sensor that passes cleanly (100), and exactly the
+  // flatline's -40 above a sensor that is stuck. If this ever drifts from 100
+  // the absence has been given a price, which is the regression.
+  assert.equal(FLAGS_PENALTIES[FLAGS.BATTERY_NOT_REPORTED], 0);
+  const capable = evaluateTelemetry(humanTelemetry());
+  const flatlined = evaluateTelemetry(flatlineTemperatureTelemetry());
+  assert.equal(result.score, 100);
+  assert.equal(result.score, capable.score, "reporting nothing is worth exactly as much as reporting honestly");
+  assert.equal(result.score, flatlined.score + FLAGS_PENALTIES.BATTERY_FLATLINE);
+  assert.equal(isTelemetryAcceptable(result), true, "a sensor-less phone is still a legitimate device");
+});
+
+test("CASE (ii) an all-null session and an honest capable session score the same, by design", () => {
+  // Stated plainly rather than papered over: there is no bonus for reporting
+  // data, because a bonus is worth farming and would make "report nothing"
+  // strictly better than "be honest". The all-null session is not silently
+  // rewarded — it is tagged, and the tag is visible in the stored telemetry.
+  const honest = evaluateTelemetry(humanTelemetry());
+  const absent = evaluateTelemetry(noTemperatureTelemetry());
+  assert.equal(absent.score, honest.score);
+  assert.deepEqual(honest.flags, []);
+  assert.deepEqual(absent.flags, [FLAGS.BATTERY_NOT_REPORTED]);
+  assert.equal(isTelemetryAcceptable(absent), isTelemetryAcceptable(honest));
+});
+
+test("CASE (ii) an absent key is treated exactly like an explicit null", () => {
+  // JSON cannot express `undefined`, so over the wire they are the same thing.
+  const missingKey = humanTelemetry().map((sample) => {
+    const next = { ...sample };
+    delete next.batteryTempC;
+    return next;
+  });
+  const explicitNull = noTemperatureTelemetry();
+  assert.deepEqual(evaluateTelemetry(missingKey), evaluateTelemetry(explicitNull));
+  assert.deepEqual(evaluateTelemetry(missingKey), { score: 100, flags: [FLAGS.BATTERY_NOT_REPORTED] });
+});
+
+test("CASE (iii) MIXED: nulls are ignored, the session is still scored as capable", () => {
+  const samples = mixedTemperatureTelemetry();
+  const result = evaluateTelemetry(samples);
+  // Documented semantics: mixed == capable. A sprinkle of nulls neither
+  // raises a flag nor buys immunity, and the run still has plenty of real
+  // drift behind it.
+  assert.deepEqual(result.flags, [], `mixed telemetry must be clean, got ${result.flags}`);
+  assert.ok(!result.flags.includes(FLAGS.BATTERY_NOT_REPORTED), "a capable device is not a sensor-less device");
+  assert.equal(result.score, 100);
+  assert.equal(isTelemetryAcceptable(result), true);
+});
+
+test("CASE (iii) MIXED: a cheater cannot escape the flatline by sprinkling nulls", () => {
+  // The anti-gaming property. A constant-temperature cheater who adds nulls
+  // must not thereby switch the battery check off: nulls are not readings, so
+  // the session still has to clear the same ">= 2 differing plausible
+  // readings" bar. And nulls can never help — they can only leave the check
+  // armed or make it stricter.
+  const sprinkled = flatlineTemperatureTelemetry(30, 31.5).map((sample, i) =>
+    i % 2 === 0 ? { ...sample, batteryTempC: null } : sample
+  );
+  const result = evaluateTelemetry(sprinkled);
+  assert.ok(result.flags.includes(FLAGS.BATTERY_FLATLINE), "half the samples null must NOT buy an escape");
+  assert.equal(result.score, 100 - FLAGS_PENALTIES.BATTERY_FLATLINE);
+
+  // And the reverse: removing every number does not dodge the flatline, it
+  // simply changes the session into CASE (ii) — neutral, tagged, and still
+  // subject to every other detector (covered below).
+  const allNull = evaluateTelemetry(noTemperatureTelemetry());
+  assert.ok(!allNull.flags.includes(FLAGS.BATTERY_FLATLINE));
+  assert.ok(allNull.flags.includes(FLAGS.BATTERY_NOT_REPORTED));
+
+  // A capable session with exactly ONE real reading cannot dodge either: one
+  // reading is zero evidence of drift.
+  const oneReal = humanTelemetry(30).map((s, i) => (i === 0 ? { ...s, batteryTempC: 30 } : { ...s, batteryTempC: null }));
+  const one = evaluateTelemetry(oneReal);
+  assert.ok(one.flags.includes(FLAGS.BATTERY_FLATLINE), "one reading is not a drifting sensor");
+  assert.ok(!one.flags.includes(FLAGS.BATTERY_NOT_REPORTED), "but the device is still capable");
+});
+
+test("CASE (iii) MIXED + an impossible value is still caught", () => {
+  const samples = mixedTemperatureTelemetry().map((sample, i) =>
+    i === 6 ? { ...sample, batteryTempC: 91.5 } : sample
+  );
+  const result = evaluateTelemetry(samples);
+  assert.ok(result.flags.includes(FLAGS.BATTERY_IMPOSSIBLE), `got ${result.flags}`);
+  assert.equal(result.score, 100 - FLAGS_PENALTIES.BATTERY_IMPOSSIBLE);
+});
+
+test("CASE (iii) an absent temperature weakens NO other detector", () => {
+  // Pixel-perfect touch, on a device with no temperature sensor at all. The
+  // detector must fire and must charge its full -25: BATTERY_NOT_REPORTED adds
+  // nothing to the deduction and takes nothing away from it.
+  const perfectTouch = noTemperatureTelemetry(30).map((sample) => ({ ...sample, touch: { x: 412, y: 883 } }));
+  const touchResult = evaluateTelemetry(perfectTouch);
+  assert.ok(touchResult.flags.includes(FLAGS.PIXEL_PERFECT_TOUCH), `got ${touchResult.flags}`);
+  assert.ok(touchResult.flags.includes(FLAGS.BATTERY_NOT_REPORTED));
+  assert.equal(touchResult.score, 100 - FLAGS_PENALTIES.PIXEL_PERFECT_TOUCH);
+  assert.equal(touchResult.score, 75);
+  // 75 is the pre-existing "one minor signal survives" boundary (it is 75
+  // whether or not the device has a battery sensor — asserted below), so the
+  // meaningful claim here is that the touch signal is still detected and still
+  // costs exactly what it costs on a capable device. A real bot trips two
+  // signals, and that is rejected outright — also without a battery sensor.
+  const noSensorBot = noTemperatureTelemetry(30).map((sample, i) => ({
+    ...sample,
+    touch: { x: 412, y: 883 },
+    scrollDelta: i === 9 ? 90000 : 500,
+  }));
+  const botResult = evaluateTelemetry(noSensorBot);
+  assert.ok(botResult.flags.includes(FLAGS.PIXEL_PERFECT_TOUCH));
+  assert.ok(botResult.flags.includes(FLAGS.INHUMAN_SCROLL_SPEED), `got ${botResult.flags}`);
+  assert.equal(
+    botResult.score,
+    100 - FLAGS_PENALTIES.PIXEL_PERFECT_TOUCH - FLAGS_PENALTIES.INHUMAN_SCROLL_SPEED
+  );
+  assert.equal(isTelemetryAcceptable(botResult), false, "a sensor-less phone can still be a bot");
+  // ...and the sensor-less deduction is exactly 0: the same bot WITH a drifting
+  // battery reading scores the identical amount.
+  const sameBotWithSensor = evaluateTelemetry(
+    noSensorBot.map((sample, i) => (i % 2 === 0 ? { ...sample, batteryTempC: 29 + i * 0.07 } : sample))
+  );
+  assert.equal(botResult.score, sameBotWithSensor.score, "the missing sensor costs nothing either way");
+
+  // Inhuman scroll velocity alone, no temperature sensor: still detected,
+  // still the documented -20.
+  const flick = noTemperatureTelemetry(30).map((sample, i) => ({ ...sample, scrollDelta: i === 9 ? 90000 : 500 }));
+  const scrollResult = evaluateTelemetry(flick);
+  assert.ok(scrollResult.flags.includes(FLAGS.INHUMAN_SCROLL_SPEED), `got ${scrollResult.flags}`);
+  assert.equal(scrollResult.score, 100 - FLAGS_PENALTIES.INHUMAN_SCROLL_SPEED);
+
+  // Too few samples, no temperature sensor.
+  const shortResult = evaluateTelemetry(noTemperatureTelemetry(MIN_TELEMETRY_SAMPLES - 1));
+  assert.ok(shortResult.flags.includes(FLAGS.TOO_FEW_SAMPLES), `got ${shortResult.flags}`);
+  assert.equal(shortResult.score, 0);
+  assert.equal(isTelemetryAcceptable(shortResult), false);
+
+  // All three at once: the sensor-less bonus does not survive any of them.
+  const allThree = evaluateTelemetry(
+    noTemperatureTelemetry(MIN_TELEMETRY_SAMPLES - 1).map((s) => ({ ...s, touch: { x: 1, y: 1 } }))
+  );
+  assert.ok(allThree.flags.includes(FLAGS.TOO_FEW_SAMPLES));
+  assert.ok(allThree.flags.includes(FLAGS.PIXEL_PERFECT_TOUCH));
+  assert.equal(allThree.score, 0);
+  assert.equal(isTelemetryAcceptable(allThree), false);
+
+  // Exactly MIN_TELEMETRY_SAMPLES, still no temperature, still clean: the
+  // informational flag does not tip the verdict either way.
+  const boundary = evaluateTelemetry(noTemperatureTelemetry(MIN_TELEMETRY_SAMPLES));
+  assert.deepEqual(boundary.flags, [FLAGS.BATTERY_NOT_REPORTED]);
+  assert.equal(boundary.score, 100);
+  assert.equal(isTelemetryAcceptable(boundary), true, "a zero-penalty flag must not flip the verdict");
+});
+
+test("BATTERY_NOT_REPORTED is the ONLY deduction a real device can never be charged for", () => {
+  // Boundary test for the new flag: the informational signal is worth exactly
+  // zero, so a session whose only flag is BATTERY_NOT_REPORTED is acceptable,
+  // and it costs the same 100 points as raising no flags at all.
+  const only = evaluateTelemetry(noTemperatureTelemetry(30));
+  assert.deepEqual(only.flags, [FLAGS.BATTERY_NOT_REPORTED]);
+  assert.equal(isTelemetryAcceptable(only), true);
+  assert.equal(only.score, evaluateTelemetry(humanTelemetry(30)).score, "same 100 points as raising no flags");
+  // And the published table says so, not merely the code path.
+  assert.equal(FLAGS_PENALTIES[FLAGS.BATTERY_NOT_REPORTED], 0);
+  for (const flag of only.flags) {
+    assert.equal(FLAGS_PENALTIES[flag], 0);
+  }
 });
 
 test("bot telemetry: PIXEL_PERFECT_TOUCH and INHUMAN_SCROLL_SPEED, unacceptable", () => {
@@ -214,8 +577,14 @@ test("a human-plausible fast flick is NOT flagged as inhuman scroll", () => {
   assert.equal(isTelemetryAcceptable(result), true);
 });
 
-test("impossible battery values: 5C, 90C and NaN all raise BATTERY_IMPOSSIBLE", () => {
-  for (const badTemp of [5, -40, 90, NaN, null, undefined, "31", Infinity]) {
+test("impossible battery values: 5C, 90C, NaN and a numeric string all raise BATTERY_IMPOSSIBLE", () => {
+  // NOTE: `null` and `undefined` used to be in this list, under the old rule
+  // that an ABSENT reading is an impossible one. They are not any more: a
+  // device with no temperature API is neutral, and the capability of the
+  // session is now decided across the whole stream, not per sample. The
+  // wrong-TYPE cases (a string, NaN, Infinity) remain impossible, because a
+  // real sensor emits a finite number or null and nothing else.
+  for (const badTemp of [5, -40, 90, NaN, "31", Infinity]) {
     const samples = humanTelemetry().map((sample, i) =>
       i === 3 ? { ...sample, batteryTempC: badTemp } : sample
     );
@@ -230,6 +599,7 @@ test("impossible battery values: 5C, 90C and NaN all raise BATTERY_IMPOSSIBLE", 
     // combine with a second signal to cross TELEMETRY_PASS_SCORE.
     assert.equal(result.score, 100 - FLAGS_PENALTIES.BATTERY_IMPOSSIBLE);
     assert.ok(!result.flags.includes(FLAGS.BATTERY_FLATLINE));
+    assert.ok(!result.flags.includes(FLAGS.BATTERY_NOT_REPORTED), "this device has a sensor");
   }
 });
 
@@ -267,6 +637,10 @@ test("exactly MIN_TELEMETRY_SAMPLES is enough to avoid TOO_FEW_SAMPLES", () => {
 test("degenerate telemetry input: empty array scores 0, does not throw; non-array throws TypeError", () => {
   const empty = evaluateTelemetry([]);
   assert.deepEqual(empty, { score: 0, flags: [FLAGS.TOO_FEW_SAMPLES] });
+  assert.ok(
+    !empty.flags.includes(FLAGS.BATTERY_NOT_REPORTED),
+    "a session with no samples reported nothing because it has no samples, not because it has no sensor"
+  );
 
   for (const bad of [undefined, null, "samples", 42, {}, new Set()]) {
     assert.throws(() => evaluateTelemetry(bad), TypeError, `input ${String(bad)}`);
@@ -290,6 +664,16 @@ test("evaluateTelemetry is pure: same input twice => deep-equal, input untouched
   assert.deepEqual(samples, snapshot, "the engine must not mutate the caller's array");
   // Same again through a reversed-shaped copy: still deterministic.
   assert.deepEqual(evaluateTelemetry(structuredClone(snapshot)), first);
+
+  // The new temperature branches are pure too: the sensor-less stream, the
+  // mixed stream and the impossible-value stream all repeat exactly, and none
+  // of them is mutated by being scored.
+  for (const stream of [noTemperatureTelemetry(), mixedTemperatureTelemetry(), impossibleTemperatureTelemetry()]) {
+    const streamSnapshot = structuredClone(stream);
+    assert.deepEqual(evaluateTelemetry(stream), evaluateTelemetry(stream));
+    assert.deepEqual(evaluateTelemetry(structuredClone(streamSnapshot)), evaluateTelemetry(stream));
+    assert.deepEqual(stream, streamSnapshot);
+  }
 });
 
 test("isTelemetryAcceptable rejects junk results", () => {
@@ -610,6 +994,7 @@ test("the exported thresholds are the documented ones", () => {
   assert.equal(SYNDICATE_SIMILARITY_THRESHOLD, 0.9);
   assert.equal(FLAGS.BATTERY_FLATLINE, "BATTERY_FLATLINE");
   assert.equal(FLAGS.BATTERY_IMPOSSIBLE, "BATTERY_IMPOSSIBLE");
+  assert.equal(FLAGS.BATTERY_NOT_REPORTED, "BATTERY_NOT_REPORTED");
   assert.equal(FLAGS.PIXEL_PERFECT_TOUCH, "PIXEL_PERFECT_TOUCH");
   assert.equal(FLAGS.INHUMAN_SCROLL_SPEED, "INHUMAN_SCROLL_SPEED");
   assert.equal(FLAGS.TOO_FEW_SAMPLES, "TOO_FEW_SAMPLES");
@@ -625,11 +1010,20 @@ test("the exported thresholds are the documented ones", () => {
     PIXEL_PERFECT_TOUCH: 25,
     INHUMAN_SCROLL_SPEED: 20,
     TOO_FEW_SAMPLES: 100,
+    // Informational: the device has no battery-temperature API. Worth exactly
+    // zero, so no honest low-end phone is docked for it.
+    BATTERY_NOT_REPORTED: 0,
   });
+  // Every flag in FLAGS must have an entry, or the deduction is implicit.
+  assert.deepEqual(Object.keys(FLAGS_PENALTIES).sort(), Object.keys(FLAGS).sort());
 });
 
 module.exports = {
   humanTelemetry,
   emulatorTelemetry,
   botTouchTelemetry,
+  noTemperatureTelemetry,
+  flatlineTemperatureTelemetry,
+  impossibleTemperatureTelemetry,
+  mixedTemperatureTelemetry,
 };
