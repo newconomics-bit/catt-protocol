@@ -6,10 +6,11 @@
   "main": "signer.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test test/content.test.js test/anticheat.test.js test/server.test.js",
+    "test": "node --test test/content.test.js test/anticheat.test.js test/server.test.js test/sqlite-store.test.js test/persistence.test.js",
     "sign:smoke": "node -e \"const s=require('./signer');console.log(Object.keys(s).join(','))\""
   },
   "dependencies": {
+    "better-sqlite3": "^13.0.3",
     "ethers": "^6.13.0",
     "express": "^4.19.2"
   },

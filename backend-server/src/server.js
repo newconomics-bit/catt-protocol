@@ -66,7 +66,7 @@ const { ethers } = require("ethers");
 const content = require("./content");
 const anticheat = require("./anticheat");
 const signer = require("../signer");
-const { createMemoryStore, assertStoreShape } = require("./storage");
+const { createMemoryStore, assertStoreShape, STORAGE_ADAPTERS, getStorageAdapter } = require("./storage");
 const relayModule = require("./relay");
 
 /**
@@ -959,6 +959,58 @@ function createApp({ store, privateKey, chainId, verifyingContract, logger, rela
 }
 
 /**
+ * Builds the storage adapter the environment asks for.
+ *
+ * DEFAULTING IS THE POINT: with nothing configured this returns
+ * `createMemoryStore()`, which is exactly what `startServer` did before any of
+ * this existed. SQLite is loaded only when an operator names it, so every
+ * existing test — and every deployment that has not opted in — behaves
+ * identically, and `better-sqlite3` is never required in that case.
+ *
+ * It is called from the DEFAULT-CONSTRUCTION PATH ONLY. `createApp` still takes
+ * an injected `store` and never consults the environment, which is what keeps
+ * the dependency injection (and therefore the tests) intact.
+ *
+ * Environment (all optional):
+ *   `CATT_STORE`   `memory` (default) or `sqlite`. Anything else is a startup
+ *                  error naming the valid values, never a silent fallback: a
+ *                  misspelled `CATT_STORE=sqlie` must not quietly produce a
+ *                  volatile Judge that forgets its nonces on every restart.
+ *   `SQLITE_PATH`  Database file for the sqlite adapter. Defaults to
+ *                  `sqlite-store.js`'s documented default, which is OUTSIDE the
+ *                  repository working tree on purpose — the file holds session
+ *                  and wallet data and must never be committed. A relative
+ *                  value is resolved against the process working directory, so
+ *                  an operator who wants one inside their own tree must say so
+ *                  AND gitignore it.
+ *
+ * @param {Object} [params]
+ * @param {Object} [params.env] Environment to read; defaults to `process.env`.
+ * @param {Console|Object} [params.logger] Sink for non-fatal warnings.
+ * @returns {Object} A store implementing `STORAGE_METHODS`.
+ * @throws {Error} If `CATT_STORE` names an adapter that does not exist.
+ */
+function createStoreFromEnv({ env, logger } = {}) {
+  const source = env || process.env;
+  const requested = String(source.CATT_STORE || "").trim().toLowerCase();
+  if (requested === "" || requested === "memory") return createMemoryStore();
+
+  const adapter = getStorageAdapter(requested);
+  if (!adapter) {
+    throw new Error(
+      `catt-judge: unknown CATT_STORE adapter "${requested}". Valid values: ` +
+        STORAGE_ADAPTERS.map((entry) => entry.id).join(", ") +
+        ". See backend-server/.env.example."
+    );
+  }
+  return adapter.load(
+    adapter.id === "sqlite"
+      ? { filename: source.SQLITE_PATH, logger: logger || console }
+      : undefined
+  );
+}
+
+/**
  * Boots the Judge from the environment and starts listening.
  *
  * Only called when the file is executed directly, so `require`-ing the module
@@ -993,7 +1045,9 @@ function startServer() {
 
   const port = Number(PORT) || 3000;
   const chainId = CHAIN_ID ? Number(CHAIN_ID) : undefined;
-  const store = createMemoryStore();
+  // `CATT_STORE=sqlite` + `SQLITE_PATH` opts into the persistent adapter;
+  // unset, this is the in-memory store the Judge has always used.
+  const store = createStoreFromEnv({ logger: console });
   const app = createApp({
     store,
     privateKey: SIGNER_PRIVATE_KEY,
@@ -1007,6 +1061,11 @@ function startServer() {
   console.log("catt-judge: chainId", chainId);
   console.log("catt-judge: verifyingContract", MINING_CLAIMER_ADDRESS);
   console.log("catt-judge: listening on port", port);
+  // Which storage adapter is live. Public configuration, not state: the sqlite
+  // path is not printed (it is host layout), only whether the Judge is
+  // persistent at all, because a Judge silently running on the volatile
+  // in-memory store is a production incident.
+  console.log("catt-judge: store", String(process.env.CATT_STORE || "memory").toLowerCase());
 
   // The gasless relay is OPTIONAL: without `RELAYER_PRIVATE_KEY` and `RPC_URL`
   // the server still starts and `/api/relay` answers 503, which tells the app
@@ -1024,6 +1083,7 @@ module.exports = {
   ERRORS,
   JUDGE_FLAGS,
   createApp,
+  createStoreFromEnv,
   startServer,
 };
 

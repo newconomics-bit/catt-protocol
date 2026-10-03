@@ -100,6 +100,32 @@
  *   --   synchronous read-modify-write, which is indivisible between awaits.
  *
  * No secret, key or credential is read, stored or logged by this module.
+ *
+ * ===========================================================================
+ * STORAGE ADAPTERS (`STORAGE_ADAPTERS` below)
+ * ===========================================================================
+ * Two adapters implement the interface frozen in `STORAGE_METHODS`:
+ *
+ *   memory  `createMemoryStore()` — the default. Process-local, volatile, and
+ *          what every test uses. Chosen unless an operator explicitly asks for
+ *          something else, so the default behaviour of the Judge is unchanged.
+ *
+ *   sqlite  `./sqlite-store.js` — the same contract, backed by a single
+ *          SQLite file through `better-sqlite3`. Sessions, telemetry,
+ *          submissions, the per-user nonce counter, issued claims and relay
+ *          records survive a process restart, and the nonce/relay invariants
+ *          that the memory store only holds in application code are additionally
+ *          enforced by `UNIQUE (user_address, nonce)` and
+ *          `UNIQUE (relayed_tx_hash)` IN THE SCHEMA. This is the
+ *          single-node / testnet persistence layer; the Postgres adapter the
+ *          DDL above describes remains the production target, and the
+ *          migration note at the top of `sqlite-store.js` covers moving data
+ *          from one to the other.
+ *
+ * Neither adapter is imported eagerly here: `sqlite-store.js` requires this
+ * module (for `STORAGE_METHODS` and `assertStoreShape`), so the reference is
+ * lazy and lives in `STORAGE_ADAPTERS[].load()`. A process that never selects
+ * the SQLite adapter therefore never loads the native module.
  */
 
 /**
@@ -666,8 +692,53 @@ function createMemoryStore() {
   return assertStoreShape(store);
 }
 
+/**
+ * Every adapter that implements `STORAGE_METHODS`, described in one place so
+ * that selecting one is a lookup rather than a `require` the caller has to
+ * know about.
+ *
+ * `load()` is called with whatever options the adapter accepts and returns a
+ * store that has already passed `assertStoreShape`. It is a function, not a
+ * module reference, so requiring THIS module does not pull in `better-sqlite3`:
+ * the SQLite adapter is loaded only when something actually selects it.
+ *
+ * @type {ReadonlyArray<{ id: string, persistent: boolean, description: string, load: (options?: Object) => Object }>}
+ */
+const STORAGE_ADAPTERS = Object.freeze([
+  Object.freeze({
+    id: "memory",
+    persistent: false,
+    description:
+      "Process-local Maps. The default: volatile by definition, and what every test uses. " +
+      "Correct only for a process that never restarts and never issues real money.",
+    load: (options) => createMemoryStore(options),
+  }),
+  Object.freeze({
+    id: "sqlite",
+    persistent: true,
+    description:
+      "SQLite file via better-sqlite3 (see ./sqlite-store.js). Survives a restart and enforces the " +
+      "nonce-uniqueness and relay-once invariants in the schema. Single-node/testnet; Postgres " +
+      "remains the production target.",
+    load: (options) => require("./sqlite-store").createSqliteStore(options),
+  }),
+]);
+
+/**
+ * Looks an adapter up by id.
+ *
+ * @param {string} id Adapter id (case-insensitive).
+ * @returns {Object|undefined} The adapter descriptor, or `undefined` if unknown.
+ */
+function getStorageAdapter(id) {
+  const wanted = String(id || "").trim().toLowerCase();
+  return STORAGE_ADAPTERS.find((adapter) => adapter.id === wanted);
+}
+
 module.exports = {
   STORAGE_METHODS,
+  STORAGE_ADAPTERS,
   assertStoreShape,
   createMemoryStore,
+  getStorageAdapter,
 };

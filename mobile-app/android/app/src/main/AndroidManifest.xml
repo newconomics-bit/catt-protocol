@@ -1,6 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- The app is a thin client over the backend Judge (`--dart-define=
-         CATT_BACKEND_URL`) and a read-only Polygon RPC, so it needs network
+    <!-- The app is a thin client over the backend Judge (configured with the
+         dart-define flag CATT_BACKEND_URL) and a read-only Polygon RPC, so it
+         needs network
          access and nothing else. No location, camera, contacts or storage.
          `flutter create` only adds INTERNET to the debug/profile manifests, so
          it is declared here for release builds too. -->

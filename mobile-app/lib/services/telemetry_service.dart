@@ -23,7 +23,10 @@
 ///    platform exposes no sensor. There is NO synthetic fallback and no jitter
 ///    anywhere in this app: fabricating plausible hardware telemetry would be
 ///    helping the reader defeat the protocol's own anti-cheat, and it would also
-///    be false data in a proof system.
+///    be false data in a proof system. The `batteryTempC` KEY is always
+///    present — as a number or as an explicit `null` — because the scorer
+///    distinguishes "no sensor" (neutral) from a malformed record, and a
+///    missing key is not a shape it scores.
 ///  * `ts` comes from the injected [TelemetryClock]. There is no inline
 ///    `DateTime.now()` in this file, so tests drive the timeline exactly.
 ///
@@ -37,6 +40,7 @@ import 'dart:async';
 import 'package:battery_plus/battery_plus.dart';
 
 import '../models/telemetry_sample.dart';
+import 'battery_source.dart';
 
 /// The flush cadence the backend contract expects (PRD 3.1: "sent to the
 /// backend every 5 seconds"). Exported so tests assert the interval the service
@@ -110,6 +114,13 @@ class _TimerHandle implements TelemetryHandle {
 }
 
 /// Reads battery signals for telemetry.
+///
+/// The SYNCHRONOUS half of the battery seam, and the type the collector and
+/// the app state hold, because closing an interval must stay synchronous: the
+/// flush tick cannot await a platform round trip on the UI thread. The
+/// asynchronous, channel-facing half is [BatterySource] in `battery_source.dart`,
+/// and [PlatformBatteryTelemetrySource] is the adapter that caches it. Tests
+/// substitute their own implementation here exactly as they always have.
 abstract class BatteryTelemetrySource {
   /// Battery temperature in degrees Celsius, or `null` when the platform
   /// exposes no such sensor.
@@ -142,37 +153,80 @@ class NullBatteryTelemetrySource implements BatteryTelemetrySource {
   Future<int?> levelPercent() async => null;
 }
 
-/// `battery_plus`-backed source.
+/// Battery telemetry read from the native platform channel, with `battery_plus`
+/// kept only as a LEVEL fallback.
 ///
-/// HONEST DEGRADATION, DOCUMENTED: `battery_plus 7.x` exposes battery LEVEL
-/// only — there is no temperature getter in the package (the 4.x
-/// `batteryTemperature` API was removed). So [temperatureC] is `null` by
-/// construction and [hasTemperatureSensor] is `false`, and the app says so in
-/// the reader rather than substituting an ambient guess. Nothing is faked: the
-/// sample carries `batteryTempC: null`, which the Judge scores as
-/// `BATTERY_IMPOSSIBLE`, and the reader is warned that hardware telemetry will
-/// cost them the claim on this device.
+/// WHY THE CHANNEL: `battery_plus` 7.x exposes a charge level and no
+/// temperature at all (the 4.x `batteryTemperature` getter was removed), so it
+/// can never satisfy `batteryTempC`. The Android platform can — see
+/// `MainActivity.kt`, which reads `BatteryManager.BATTERY_PROPERTY_TEMPERATURE`
+/// and falls back to the `ACTION_BATTERY_CHANGED` sticky intent, dividing the
+/// raw tenths of a degree by 10 on both paths. [BatterySource] isolates that
+/// conversation and degrades to `null` wherever the channel is missing (iOS,
+/// desktop, tests).
 ///
-/// If a future plugin version exposes a real temperature, this is the single
-/// place to wire it: the sampling, batching and payload paths above are
-/// unchanged and already testable.
-class PlatformBatteryTelemetrySource implements BatteryTelemetrySource {
-  /// Creates the source over [battery].
-  PlatformBatteryTelemetrySource({Future<int> Function()? levelReader})
-      : _levelReader = levelReader ?? _platformLevel;
+/// WHY THE CACHE: a platform channel call is asynchronous but closing an
+/// interval is not, so the last reading is cached and refreshed by the collector
+/// ([TelemetryService.start] and every closed interval). A sample therefore
+/// carries the most recent real reading — at most one flush interval old — and
+/// `null` until the first read comes back. `null` is never replaced by a
+/// guess, and a reading that stops being available goes back to `null` rather
+/// than freezing on the last value, because a frozen battery temperature is
+/// exactly the `BATTERY_FLATLINE` signature the scorer punishes.
+///
+/// `battery_plus` is still used for [levelPercent] when the channel has no
+/// answer, which is what keeps iOS showing a charge percentage in the wallet
+/// screen. The level is informational and is never part of the payload.
+class PlatformBatteryTelemetrySource
+    implements BatteryTelemetrySource, RefreshableBatterySource {
+  /// Creates the source over [source], defaulting to the platform channel.
+  PlatformBatteryTelemetrySource({
+    BatterySource? source,
+    Future<int> Function()? levelReader,
+  })  : _source = source ?? MethodChannelBatterySource(),
+        _levelReader = levelReader ?? _platformLevel;
 
+  final BatterySource _source;
   final Future<int> Function() _levelReader;
 
   static Future<int> _platformLevel() => Battery().batteryLevel;
 
-  @override
-  double? temperatureC() => null;
+  double? _temperatureC;
+  bool _temperatureSupported = false;
 
   @override
-  bool get hasTemperatureSensor => false;
+  double? temperatureC() => _temperatureC;
+
+  @override
+  bool get hasTemperatureSensor => _temperatureSupported;
+
+  /// Re-reads the channel and updates the cached temperature.
+  ///
+  /// Fire-and-forget safe: any failure leaves the cache exactly as it was and
+  /// never propagates, so a telemetry tick cannot be taken down by a missing
+  /// platform channel.
+  @override
+  Future<void> refresh() async {
+    try {
+      final temperature = await _source.temperatureC();
+      _temperatureC = temperature;
+      // Capability is sticky once proven: a single failed read is a missing
+      // SAMPLE, not proof that the hardware lost the sensor, and flipping the
+      // flag back would make the reader screen claim a device is incapable
+      // between two good readings.
+      _temperatureSupported = temperature != null ||
+          _temperatureSupported ||
+          await _source.probeTemperatureSupport();
+    } catch (_) {
+      // Defence in depth: BatterySource implementations already fail soft, so
+      // this only guards against a misbehaving injected source.
+    }
+  }
 
   @override
   Future<int?> levelPercent() async {
+    final fromChannel = await _source.levelPercent();
+    if (fromChannel != null) return fromChannel;
     try {
       return await _levelReader();
     } catch (_) {
@@ -221,7 +275,10 @@ class TelemetryService {
   /// Drives the periodic flush.
   final TelemetryScheduler scheduler;
 
-  /// Battery signals, degrading to "no sensor" when unavailable.
+  /// Battery signals, degrading to "no sensor" when unavailable. Injected so
+  /// the collector never touches a platform channel itself; production passes
+  /// [PlatformBatteryTelemetrySource], which reads the native channel through
+  /// [BatterySource].
   final BatteryTelemetrySource battery;
 
   /// How often a batch is closed and uploaded.
@@ -245,6 +302,28 @@ class TelemetryService {
   /// Whether this device can supply a battery temperature at all.
   bool get hasBatteryTemperature => battery.hasTemperatureSensor;
 
+  /// Re-reads the battery source when it caches its reading, so the NEXT
+  /// closed interval carries a fresh temperature.
+  ///
+  /// The refresh is a fire-and-forget round trip: closing an interval stays
+  /// synchronous (the flush tick must not block the UI thread on a platform
+  /// channel), so a sample carries the reading taken at most one interval
+  /// earlier. Sources that do not cache — every test fake, and the null source
+  /// — are skipped entirely.
+  void _scheduleBatteryRefresh() {
+    final source = battery;
+    if (source is! RefreshableBatterySource) return;
+    unawaited((source as RefreshableBatterySource).refresh());
+  }
+
+  /// Awaits the first battery read so the very first sample of a session is not
+  /// forced to report `null` merely because the channel had not answered yet.
+  Future<void> _primeBattery() async {
+    final source = battery;
+    if (source is! RefreshableBatterySource) return;
+    await (source as RefreshableBatterySource).refresh();
+  }
+
   /// Starts sampling for [sessionId].
   ///
   /// Starting for the same session twice is a no-op, so a widget rebuild does
@@ -254,6 +333,7 @@ class TelemetryService {
     if (_disposed) return;
     if (_handle != null && _sessionId == sessionId) return;
     if (_handle != null) await stop();
+    await _primeBattery();
     _sessionId = sessionId;
     _handle = scheduler.schedulePeriodic(flushInterval, tick);
   }
@@ -285,9 +365,14 @@ class TelemetryService {
   TelemetrySample? takeIntervalSample() {
     final sessionId = _sessionId;
     if (sessionId == null || sessionId.isEmpty) return null;
+    // Read the temperature this interval closes on, then kick off the read for
+    // the next one. `null` here means "no reading yet / no sensor" and is
+    // carried into the sample as an explicit null — never a substitute value.
+    final temperature = battery.temperatureC();
+    _scheduleBatteryRefresh();
     final sample = TelemetrySample(
       ts: clock.nowMs(),
-      batteryTempC: battery.temperatureC(),
+      batteryTempC: temperature,
       touch: _pendingTouch,
       scrollDelta: _pendingScrollDelta,
     );
