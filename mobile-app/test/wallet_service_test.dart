@@ -10,9 +10,12 @@ import 'package:catt_app/services/session_id.dart';
 import 'package:catt_app/services/wallet_service.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// The private key used throughout this file. It is a throwaway test vector: it
-/// is published nowhere, funds nothing, and exists only so the address derived
-/// from it can be asserted deterministically.
+/// The private key used throughout this file. A well-known, publicly published
+/// example key taken from the web3 / web3dart documentation, deliberately
+/// public: it funds nothing on any network, so it is safe to commit in a test
+/// fixture. It is pinned, not randomly generated, so the derived address can
+/// be asserted deterministically. Never reuse it where real value or secrecy
+/// matters: real keys come from `WalletService` generation and secure storage.
 const String kTestPrivateKey =
     '4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d';
 
