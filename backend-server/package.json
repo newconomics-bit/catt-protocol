@@ -5,10 +5,13 @@
   "license": "MIT",
   "main": "signer.js",
   "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/content.test.js test/anticheat.test.js test/server.test.js",
     "sign:smoke": "node -e \"const s=require('./signer');console.log(Object.keys(s).join(','))\""
   },
   "dependencies": {
-    "ethers": "^6.13.0"
+    "ethers": "^6.13.0",
+    "express": "^4.19.2"
   },
   "engines": {
     "node": ">=18"
