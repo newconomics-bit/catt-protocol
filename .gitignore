@@ -1,0 +1,14 @@
+node_modules/
+artifacts/
+cache/
+typechain-types/
+coverage/
+coverage.json
+.env
+.env.*
+!.env.example
+.DS_Store
+temp/
+.openzeppelin/
+logs/
+*.log

@@ -1,0 +1,16 @@
+{
+  "name": "catt-backend",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "main": "signer.js",
+  "scripts": {
+    "sign:smoke": "node -e \"const s=require('./signer');console.log(Object.keys(s).join(','))\""
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
