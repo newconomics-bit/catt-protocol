@@ -1,0 +1,22 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    # Treat anything that could hide a type or null-safety mistake as fatal.
+    unused_import: error
+    unused_local_variable: error
+  exclude:
+    - build/**
+    - android/**
+    - linux/**
+
+linter:
+  rules:
+    # Telemetry and wallet code must never `print` (PRD 5, Rule 2). There is no
+    # legitimate reason to print anything from this app.
+    avoid_print: true
+    prefer_final_locals: true
+    prefer_single_quotes: true
+    always_declare_return_types: true
+    unawaited_futures: true
+    use_super_parameters: true
