@@ -77,8 +77,11 @@
  *     deadline     bigint NOT NULL,
  *     signature    text NOT NULL,
  *     issued_at    timestamptz NOT NULL DEFAULT now(),
+ *     relayed_tx_hash    text,              -- NULL until the gasless relay broadcasts
+ *     relayed_at         timestamptz,       -- NULL until it does
  *     PRIMARY KEY (user_address, nonce),
- *     CONSTRAINT issued_claims_unique_nonce UNIQUE (user_address, nonce)
+ *     CONSTRAINT issued_claims_unique_nonce UNIQUE (user_address, nonce),
+ *     CONSTRAINT issued_claims_unique_relay_tx UNIQUE (relayed_tx_hash)
  *   )
  *   -- The PRIMARY KEY is the DB-level equivalent of reserveNonce()'s
  *   -- guarantee: two concurrent transactions cannot obtain the same
@@ -86,6 +89,15 @@
  *   -- the moment the row lands. The memory store mirrors this by advancing a
  *   -- per-user counter on EVERY reserveNonce() call, before the caller has
  *   -- had any chance to sign.
+ *   -- The SECOND unique index is the relay double-spend guard. `markRelayed`
+ *   --   is `UPDATE issued_claims SET relayed_tx_hash = $tx, relayed_at = now()
+ *   --   WHERE user_address = $1 AND nonce = $2 AND relayed_tx_hash IS NULL`
+ *   --   and the caller treats `rowCount === 0` as ALREADY RELAYED. Making the
+ *   --   uniqueness of a relayed transaction hash a DATABASE constraint means
+ *   --   two concurrent relayers of the same nonce cannot both succeed: the
+ *   --   second one hits the index rather than winning a race in application
+ *   --   code. The memory store below serialises the same check behind a
+ *   --   synchronous read-modify-write, which is indivisible between awaits.
  *
  * No secret, key or credential is read, stored or logged by this module.
  */
@@ -110,6 +122,8 @@ const STORAGE_METHODS = Object.freeze([
   "reserveNonce",
   "isNonceUsed",
   "recordIssuedClaim",
+  "getIssuedClaim",
+  "markRelayed",
   "close",
   "dispose",
 ]);
@@ -182,6 +196,24 @@ function createMemoryStore() {
   let nextSubmissionId = 1;
   /** Monotonic insertion counter used to give telemetry a stable order. */
   let telemetrySeq = 0;
+
+  /**
+   * The key an issued claim is stored under.
+   *
+   * Addresses are compared case-INSENSITIVELY: a client may present the
+   * checksummed form it received from `/api/submit` while a lookup elsewhere
+   * uses the lowercase form, and those are the same user. Normalising here
+   * means a relay attempt can never miss the issuance record (and therefore
+   * skip the cross-check) purely because of address casing. The nonce is
+   * normalised to a number for the same reason.
+   *
+   * @param {string} userAddress Wallet address.
+   * @param {number|string} nonce Claim nonce.
+   * @returns {string} Storage key.
+   */
+  function claimKey(userAddress, nonce) {
+    return `${String(userAddress).toLowerCase()}:${Number(nonce)}`;
+  }
 
   /**
    * Ensures a session row exists. Telemetry is allowed to arrive before (or
@@ -480,9 +512,105 @@ function createMemoryStore() {
         deadline: deadline ?? null,
         signature: signature ?? null,
         issuedAt: Date.now(),
+        // Relay bookkeeping: null until a gasless relay broadcast settles.
+        relayerTxHash: null,
+        relayedAt: null,
       };
-      issuedClaims.set(`${record.userAddress}:${record.nonce}`, record);
+      const key = claimKey(record.userAddress, record.nonce);
+      const existing = issuedClaims.get(key);
+      if (existing) {
+        // Re-issuing an existing (user, nonce) must never silently discard the
+        // relay record: if the claim was already relayed, that fact survives.
+        record.relayerTxHash = existing.relayerTxHash ?? null;
+        record.relayedAt = existing.relayedAt ?? null;
+        record.issuedAt = existing.issuedAt;
+      }
+      issuedClaims.set(key, record);
       return clone(record);
+    },
+
+    /**
+     * Reads back the issuance record for a nonce, or `undefined` when this
+     * backend never issued it.
+     *
+     * Used by `POST /api/relay` as a CROSS-CHECK: a claim the Judge issued
+     * must carry exactly the reward, stamina cost and deadline that were
+     * signed. Absence is not an error — a user claiming from a different
+     * client, or against a backend that restarted with an empty store, has no
+     * record here and is still allowed through, because the signature check
+     * (`relay.validateClaimPayload`) is the actual authority on what was
+     * signed. The record exists to catch a caller substituting different
+     * amounts for an issuance it can name.
+     *
+     * @param {string} userAddress Wallet address.
+     * @param {number|string} nonce Claim nonce.
+     * @returns {Promise<Object|undefined>} `{ userAddress, nonce, sessionId, digest,
+     *   reward, staminaCost, deadline, signature, relayerTxHash }`, or `undefined`.
+     */
+    async getIssuedClaim(userAddress, nonce) {
+      const record = issuedClaims.get(claimKey(userAddress, nonce));
+      return record ? clone(record) : undefined;
+    },
+
+    /**
+     * Records that a gasless relay broadcast a claim's transaction, ONCE.
+     *
+     * THE DOUBLE-SPEND GUARD. A nonce may be relayed AT MOST ONCE. This is
+     * not an optimisation — it is what stops a mobile app on a flaky
+     * connection from paying out twice: the app retries `POST /api/relay`
+     * whenever the first request looks like it failed (which it may well have
+     * succeeded), and without this the retry would broadcast the same
+     * signature a second time. On-chain `usedNonces` would reject the second
+     * one and revert it, so the user would lose the gas and get a confusing
+     * failure; here it is a clean, detectable `false` the HTTP layer turns into
+     * a 409. The guard is deliberately placed AFTER the broadcast in the route
+     * (so a lost connection is recorded rather than repeated) and re-checked
+     * on the way in.
+     *
+     * Idempotent by NON-repetition, not by ignoring the second call: a nonce
+     * that already carries a `relayerTxHash` is left untouched and `false` is
+     * returned, so the caller can distinguish "I recorded this" from "somebody
+     * else already did".
+     *
+     * A nonce with NO existing issuance record still gets one, carrying only
+     * the relay fields: an unrecorded-but-relayed claim must be just as
+     * un-relayable as a recorded one.
+     *
+     * Postgres:
+     * `UPDATE issued_claims SET relayed_tx_hash = $3, relayed_at = now()
+     *  WHERE user_address = $1 AND nonce = $2 AND relayed_tx_hash IS NULL`
+     * returning `rowCount === 1`; `rowCount === 0` is the already-relayed case.
+     * `UNIQUE(relayed_tx_hash)` backstops it at the database level.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet the claim is for.
+     * @param {number|string} params.nonce Claim nonce.
+     * @param {string} params.txHash Transaction hash the relayer broadcast.
+     * @returns {Promise<boolean>} True if this call performed the recording;
+     *   false if the nonce had already been relayed.
+     */
+    async markRelayed({ userAddress, nonce, txHash } = {}) {
+      const key = claimKey(userAddress, nonce);
+      const record = issuedClaims.get(key);
+      if (record && record.relayerTxHash) {
+        // Already relayed: refuse, and do not overwrite the winning hash.
+        return false;
+      }
+      const target = record || {
+        userAddress: userAddress ?? null,
+        nonce: Number(nonce),
+        sessionId: null,
+        digest: null,
+        reward: null,
+        staminaCost: null,
+        deadline: null,
+        signature: null,
+        issuedAt: Date.now(),
+      };
+      target.relayerTxHash = txHash ?? null;
+      target.relayedAt = Date.now();
+      issuedClaims.set(key, target);
+      return true;
     },
 
     /**
@@ -516,16 +644,21 @@ function createMemoryStore() {
     /**
      * Snapshot of the full in-memory state, for assertions in tests.
      *
-     * @returns {{ sessions: number, telemetry: number, submissions: number, issuedClaims: number }}
+     * @returns {{ sessions: number, telemetry: number, submissions: number, issuedClaims: number, relayedClaims: number }}
      */
     _debugState() {
       let telemetryCount = 0;
       for (const bucket of telemetry.values()) telemetryCount += bucket.length;
+      let relayedClaims = 0;
+      for (const record of issuedClaims.values()) {
+        if (record.relayerTxHash) relayedClaims += 1;
+      }
       return {
         sessions: sessions.size,
         telemetry: telemetryCount,
         submissions: submissionOrder.length,
         issuedClaims: issuedClaims.size,
+        relayedClaims,
       };
     },
   };

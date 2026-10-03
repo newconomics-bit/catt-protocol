@@ -1,0 +1,38 @@
+name: catt_app
+description: "CATT Protocol mobile client — Proof-of-Attention learn-to-earn app."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Wallet generation + address derivation + read-only eth_call balance reads.
+  web3dart: ^3.0.3
+  # Private-key storage. Abstractions live in lib/services/key_store.dart so
+  # tests never touch the platform channel.
+  flutter_secure_storage: ^11.2.0
+  # Battery level. NOTE: battery_plus 7.x exposes NO temperature API (the 4.x
+  # `batteryTemperature` getter was removed), so telemetry reports
+  # `batteryTempC: null` on every device rather than guessing. See
+  # PlatformBatteryTelemetrySource.
+  battery_plus: ^7.1.2
+  http: ^1.6.0
+  provider: ^6.1.5
+  # Direct dependency for `EthereumAddress`, which web3dart uses but does not
+  # re-export. Already a transitive dependency of web3dart; pinned explicitly
+  # because the app names the type when building the balanceOf read.
+  wallet: ^0.0.18
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  fake_async: ^1.3.3
+
+flutter:
+  uses-material-design: true

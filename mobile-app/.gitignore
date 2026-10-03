@@ -1,0 +1,26 @@
+# Dart / Flutter build output
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.flutter-plugins-vscode
+
+# Local tooling / IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# Secrets: nothing in this app is hardcoded, but a developer-local override
+# must never be committed.
+.env
+.env.*
+!.env.example
+
+# OS / logs
+.DS_Store
+*.log

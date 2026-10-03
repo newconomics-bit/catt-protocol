@@ -67,6 +67,7 @@ const content = require("./content");
 const anticheat = require("./anticheat");
 const signer = require("../signer");
 const { createMemoryStore, assertStoreShape } = require("./storage");
+const relayModule = require("./relay");
 
 /**
  * Lifetime of a signed mining claim, in seconds.
@@ -103,6 +104,15 @@ const ERRORS = Object.freeze({
   NOT_FOUND: "NOT_FOUND",
   INVALID_JSON: "INVALID_JSON",
   INTERNAL_ERROR: "INTERNAL_ERROR",
+  /* --- gasless relay (see /api/relay) --- */
+  INVALID_CLAIM: "INVALID_CLAIM",
+  RELAY_NOT_CONFIGURED: "RELAY_NOT_CONFIGURED",
+  RELAY_CLAIM_EXPIRED: "RELAY_CLAIM_EXPIRED",
+  RELAY_SIGNATURE_INVALID: "RELAY_SIGNATURE_INVALID",
+  RELAY_CLAIM_MISMATCH: "RELAY_CLAIM_MISMATCH",
+  RELAY_ALREADY_RELAYED: "RELAY_ALREADY_RELAYED",
+  RELAY_TX_REVERTED: "RELAY_TX_REVERTED",
+  RELAY_TX_FAILED: "RELAY_TX_FAILED",
 });
 
 /**
@@ -237,12 +247,89 @@ function safeEvaluateTelemetry(samples) {
 }
 
 /**
+ * True when the injected relay could actually broadcast a transaction.
+ *
+ * Tolerant of a partial stub on purpose: an injected test double is only
+ * required to expose `isConfigured`, so a missing method reads as "not
+ * configured" (a 503), never as a crash.
+ *
+ * @param {Object} relay Relay service.
+ * @returns {boolean}
+ */
+function relayIsConfigured(relay) {
+  if (!relay || typeof relay.isConfigured !== "function") return false;
+  try {
+    return relay.isConfigured() === true;
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * The relayer's PUBLIC address, or `null`. Never key material: the relayer
+ * object only ever exposes an address, and nothing here stringifies it.
+ *
+ * @param {Object} relay Relay service.
+ * @returns {Promise<string|null>}
+ */
+async function relayRelayerAddress(relay) {
+  if (!relay) return null;
+  try {
+    if (typeof relay.relayerAddress === "function") {
+      const sync = relay.relayerAddress();
+      if (sync) return sync;
+    }
+    if (typeof relay.getRelayerAddress === "function") {
+      return (await relay.getRelayerAddress()) || null;
+    }
+  } catch (err) {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * The address whose signatures the claimer will accept: the injected override
+ * if there is one, otherwise `MiningClaimer.signer()` read from the chain.
+ *
+ * Returns `null` when neither is available (offline, unconfigured, or a stub
+ * with no chain behind it). That is NOT a failure: the contract compares the
+ * recovered signer itself and reverts `ClaimSignatureInvalid`, so the worst a
+ * `null` here can cost is a sponsored transaction that reverts. When the chain
+ * IS reachable the value is used to reject such a claim locally, for free.
+ *
+ * @param {Object} relay Relay service.
+ * @param {string} [override] Injected expected signer.
+ * @returns {Promise<string|null>}
+ */
+async function relayExpectedSigner(relay, override) {
+  if (typeof override === "string" && ethers.isAddress(override)) return override;
+  if (relay && typeof relay.getExpectedSigner === "function") {
+    try {
+      const fromChain = await relay.getExpectedSigner();
+      if (typeof fromChain === "string" && ethers.isAddress(fromChain)) return fromChain;
+    } catch (err) {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
  * Builds the express application.
  *
  * Every dependency is injected with a sane default, which is the whole reason
  * the app is testable: a test can pass a throwaway in-memory store, a throwaway
- * private key and a recording logger without touching `process.env` or any
- * module-level state.
+ * private key, a recording logger and a stub relay service without touching
+ * `process.env` or any module-level state.
+ *
+ * `relayService` is optional and defaults to one built from `process.env`
+ * (`RELAYER_PRIVATE_KEY`, `RPC_URL`, `CHAIN_ID`, `MINING_CLAIMER_ADDRESS`).
+ * When those are absent — the normal case for a dev box, and a supported
+ * deployment mode — the default service simply reports `isConfigured() ===
+ * false` and `/api/relay` answers 503, which tells the app to fall back to
+ * submitting the transaction itself. No existing behaviour changes when the
+ * relay is unconfigured: nothing else in this file consults it.
  *
  * @param {Object} [params]
  * @param {Object} [params.store] Storage interface implementation; defaults to `createMemoryStore()`.
@@ -250,10 +337,14 @@ function safeEvaluateTelemetry(samples) {
  * @param {number|string} [params.chainId] EVM chain id for the EIP-712 domain.
  * @param {string} [params.verifyingContract] Deployed MiningClaimer address.
  * @param {Console|Object} [params.logger] Sink for server-side logs; defaults to `console`.
+ * @param {Object} [params.relayService] Gasless relay adapter (see ./relay.js).
+ * @param {string} [params.expectedSigner] Override for the address whose
+ *   signatures the claimer accepts. Used by tests and by offline deployments;
+ *   when omitted the value is read from the chain via `MiningClaimer.signer()`.
  * @returns {import("express").Express} The configured app.
  * @throws {Error} If the injected store does not implement the storage interface.
  */
-function createApp({ store, privateKey, chainId, verifyingContract, logger } = {}) {
+function createApp({ store, privateKey, chainId, verifyingContract, logger, relayService, expectedSigner } = {}) {
   const activeStore = store || createMemoryStore();
 
   // Fail fast and loudly: a Postgres adapter that forgets a method must not be
@@ -261,6 +352,13 @@ function createApp({ store, privateKey, chainId, verifyingContract, logger } = {
   assertStoreShape(activeStore);
 
   const log = logger || console;
+  const activeRelay =
+    relayService ||
+    relayModule.createRelayServiceFromEnv({
+      chainId,
+      claimerAddress: verifyingContract,
+      logger: log,
+    });
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: BODY_LIMIT, strict: true }));
@@ -614,6 +712,220 @@ function createApp({ store, privateKey, chainId, verifyingContract, logger } = {
   }));
 
   /* ---------------------------------------------------------------- *
+   * GET /api/relay/status — can the app be gasless?                     *
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Tells the mobile app whether to expect a sponsored claim or to submit the
+   * transaction itself.
+   *
+   * It answers with PUBLIC facts only: a boolean and the relayer's address.
+   * The relayer key is not reachable from here and never leaves the process —
+   * the only way to obtain it would be the environment, and this handler does
+   * not read one.
+   *
+   * `configured: false` is the supported, expected state for a deployment
+   * without a relayer, so the app falls back to a wallet-side submission
+   * instead of failing.
+   */
+  app.get("/api/relay/status", asyncHandler(async (req, res) => {
+    const configured = relayIsConfigured(activeRelay);
+    const relayer = configured ? await relayRelayerAddress(activeRelay) : null;
+    res.json({ configured, relayer });
+  }));
+
+  /* ---------------------------------------------------------------- *
+   * POST /api/relay — the gasless claim (PRD 3.2)                      *
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Broadcasts a Judge-issued claim on the user's behalf, so the user never
+   * needs MATIC. `MiningClaimer.claimReward` credits `user`, not `msg.sender`,
+   * so sponsoring a stranger's claim can only ever pay the address the Judge
+   * signed for — `user` is inside the signature.
+   *
+   * THE ORDER OF THE CHECKS IS THE WHOLE POINT, and it is deliberate:
+   *
+   *   1. SHAPE first (400 `INVALID_CLAIM`). Cheapest possible rejection, and
+   *      it keeps a malformed body from reaching crypto or a provider.
+   *   2. CONFIGURED second (503 `RELAY_NOT_CONFIGURED`). The honest answer
+   *      when there is no relayer key or RPC endpoint. It is checked before
+   *      any expensive validation because "this deployment cannot relay at
+   *      all" is a fact about the server, not about the claim, and it must not
+   *      be masked by a claim-specific error. It is also what lets the app
+   *      fall back to submitting the transaction itself.
+   *   3. EXPIRY third (400 `RELAY_CLAIM_EXPIRED`). A deadline inside the
+   *      signature has already elapsed on our clock, so the chain would reject
+   *      it; refusing here saves the gas and tells the user to re-mine.
+   *   4. SIGNATURE fourth (400 `RELAY_SIGNATURE_INVALID`). The digest is
+   *      REBUILT from the fields as received, so altering `reward`,
+   *      `staminaCost`, `nonce`, `deadline` or `user` changes the digest and
+   *      the recovered signer stops matching. This is defense in depth: the
+   *      contract re-checks it, but here a forgery costs nothing.
+   *   5. ISSUANCE CROSS-CHECK fifth (400 `RELAY_CLAIM_MISMATCH`). When this
+   *      backend knows it issued the nonce, the submitted amounts must match
+   *      the record exactly. An UNKNOWN nonce is allowed: a signature issued by
+   *      a sibling Judge instance, or by an earlier deployment, is still a
+   *      valid signature, and step 4 already proved it. Refusing unknown
+   *      nonces would make the relayer useless behind a load balancer with
+   *      more than one instance.
+   *   6. ALREADY RELAYED sixth (409 `RELAY_ALREADY_RELAYED`). The mobile app
+   *      retries aggressively on a flaky connection, and a retry of a request
+   *      that actually succeeded must not broadcast a second transaction. It
+   *      is re-checked after the broadcast as well.
+   *   7. BROADCAST, RECORD, RESPOND. The record is written AFTER the broadcast
+   *      on purpose: a connection that dies mid-flight leaves the claim
+   *      marked relayed rather than silently replayable.
+   *   8. A REVERT is a 502 with a short sanitized reason and the nonce is
+   *      deliberately NOT marked relayed: nothing was paid, so the claim is
+   *      still relayable (and the user should be able to retry it).
+   */
+  app.post("/api/relay", asyncHandler(async (req, res) => {
+    const body = req.body || {};
+    const { user, reward, staminaCost, nonce, deadline, signature } = body;
+
+    /* --- 1. Shape. Nothing malformed reaches crypto or a chain. --- */
+    let claim;
+    try {
+      claim = relayModule.normalizeClaimPayload({ user, reward, staminaCost, nonce, deadline, signature });
+    } catch (err) {
+      return sendError(res, 400, ERRORS.INVALID_CLAIM);
+    }
+
+    /* --- 2. Is a relayer even deployed here? --- */
+    if (!relayIsConfigured(activeRelay)) {
+      return sendError(res, 503, ERRORS.RELAY_NOT_CONFIGURED);
+    }
+
+    /* --- 3. Deadline. The contract accepts `block.timestamp <= deadline`. --- */
+    if (Number(claim.deadline) < Math.floor(Date.now() / 1000)) {
+      return sendError(res, 400, ERRORS.RELAY_CLAIM_EXPIRED);
+    }
+
+    /* --- 4. Signature over the digest rebuilt from the fields received. --- */
+    const signerAddress = await relayExpectedSigner(activeRelay, expectedSigner);
+    let recovered;
+    try {
+      const validated =
+        typeof activeRelay.validateClaimPayload === "function"
+          ? activeRelay.validateClaimPayload({ ...claim, expectedSigner: signerAddress })
+          : relayModule.validateClaimPayload({
+              ...claim,
+              chainId,
+              verifyingContract,
+              expectedSigner: signerAddress,
+            });
+      recovered = validated.recoveredSigner;
+    } catch (err) {
+      const code = err && typeof err.code === "string" ? err.code : null;
+      if (code === relayModule.RELAY_ERRORS.INVALID_CLAIM) return sendError(res, 400, ERRORS.INVALID_CLAIM);
+      if (code === relayModule.RELAY_ERRORS.NOT_CONFIGURED) return sendError(res, 503, ERRORS.RELAY_NOT_CONFIGURED);
+      if (code === relayModule.RELAY_ERRORS.SIGNATURE_INVALID) {
+        return sendError(res, 400, ERRORS.RELAY_SIGNATURE_INVALID);
+      }
+      // Anything else is OUR bug, not the caller's: it is re-thrown so the JSON
+      // error handler turns it into an opaque 500 and an alert. Mapping an
+      // unexpected failure onto 400 would silently blame the client for a
+      // defect in this process.
+      throw err;
+    }
+    if (typeof recovered !== "string" || !ethers.isAddress(recovered)) {
+      return sendError(res, 400, ERRORS.RELAY_SIGNATURE_INVALID);
+    }
+    if (signerAddress === null && log && typeof log.debug === "function") {
+      log.debug("catt-relay: no expected signer available; relying on the contract's own check");
+    }
+
+    /* --- 5 + 6. Issuance cross-check and double-relay guard. --- */
+    let record;
+    if (typeof activeStore.getIssuedClaim === "function") {
+      record = await activeStore.getIssuedClaim(claim.user, claim.nonce);
+    }
+    if (record) {
+      // A relay-only row (created by `markRelayed` for a claim this backend
+      // never issued) has NULL reward/staminaCost/deadline. There is nothing
+      // recorded to disagree with, so those fields are skipped rather than
+      // compared — and, just as importantly, not `BigInt(null)`-ed.
+      const sameReward = record.reward === null || record.reward === undefined || BigInt(record.reward) === BigInt(claim.reward);
+      const sameStamina =
+        record.staminaCost === null || record.staminaCost === undefined || BigInt(record.staminaCost) === BigInt(claim.staminaCost);
+      const sameDeadline =
+        record.deadline === null || record.deadline === undefined || Number(record.deadline) === Number(claim.deadline);
+      if (!sameReward || !sameStamina || !sameDeadline) {
+        return sendError(res, 400, ERRORS.RELAY_CLAIM_MISMATCH);
+      }
+      if (record.relayerTxHash) {
+        return sendError(res, 409, ERRORS.RELAY_ALREADY_RELAYED);
+      }
+    }
+
+    /* --- 7. Broadcast, record, respond. --- */
+    let relayed;
+    try {
+      relayed = await activeRelay.submitClaim({
+        user: claim.user,
+        reward: claim.reward,
+        staminaCost: claim.staminaCost,
+        nonce: claim.nonce,
+        deadline: claim.deadline,
+        signature: claim.signature,
+      });
+    } catch (err) {
+      const code = err && typeof err.code === "string" ? err.code : relayModule.RELAY_ERRORS.TX_FAILED;
+      if (code === relayModule.RELAY_ERRORS.TX_REVERTED) {
+        // NOT marked relayed: nothing was paid, so the nonce stays relayable.
+        if (log && typeof log.warn === "function") {
+          log.warn("catt-relay: claim transaction reverted", {
+            user: claim.user,
+            nonce: claim.nonce,
+            reason: err && typeof err.reason === "string" ? err.reason : "execution reverted",
+          });
+        }
+        return res.status(502).json({
+          error: ERRORS.RELAY_TX_REVERTED,
+          reason: err && typeof err.reason === "string" ? err.reason : "execution reverted",
+        });
+      }
+      if (log && typeof log.error === "function") {
+        log.error("catt-relay: broadcast failed", err && err.message ? err.message : String(err));
+      }
+      return res.status(502).json({
+        error: ERRORS.RELAY_TX_FAILED,
+        reason: err && typeof err.reason === "string" ? err.reason : "broadcast failed",
+      });
+    }
+
+    const txHash = relayed && typeof relayed.txHash === "string" ? relayed.txHash : null;
+
+    // Re-checked after the broadcast: if another concurrent request for the
+    // same nonce recorded first, this call did not own the nonce even though
+    // it did broadcast. The chain settles it, but it must be visible.
+    let recorded = true;
+    if (typeof activeStore.markRelayed === "function") {
+      recorded = await activeStore.markRelayed({
+        userAddress: claim.user,
+        nonce: claim.nonce,
+        txHash,
+      });
+    }
+    if (!recorded && log && typeof log.warn === "function") {
+      log.warn("catt-relay: nonce was already relayed by a concurrent request", {
+        user: claim.user,
+        nonce: claim.nonce,
+        txHash,
+      });
+    }
+
+    res.status(200).json({
+      txHash,
+      status: relayed && relayed.status !== undefined ? relayed.status : null,
+      relayer: await relayRelayerAddress(activeRelay),
+      user: claim.user,
+      nonce: claim.nonce,
+    });
+  }));
+
+  /* ---------------------------------------------------------------- *
    * Error handling                                                      *
    * ---------------------------------------------------------------- */
 
@@ -695,6 +1007,14 @@ function startServer() {
   console.log("catt-judge: chainId", chainId);
   console.log("catt-judge: verifyingContract", MINING_CLAIMER_ADDRESS);
   console.log("catt-judge: listening on port", port);
+
+  // The gasless relay is OPTIONAL: without `RELAYER_PRIVATE_KEY` and `RPC_URL`
+  // the server still starts and `/api/relay` answers 503, which tells the app
+  // to submit the claim itself. Only the boolean is reported — the relayer
+  // key is never read into a log line.
+  const relayConfigured =
+    Boolean(process.env.RELAYER_PRIVATE_KEY) && Boolean(process.env.RPC_URL) && Boolean(process.env.MINING_CLAIMER_ADDRESS);
+  console.log("catt-judge: gasless relay configured", relayConfigured);
 
   return app.listen(port);
 }
