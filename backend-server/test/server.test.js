@@ -452,7 +452,7 @@ test("GET /api/article/:id is byte-identical for the same session and permuted a
   for (const session of ["s1", ...others]) {
     const res = await http(`/api/article/${ARTICLE_ID}?session=${session}`);
     assert.equal(res.status, 200);
-    orders.set(session, res.body.paragraphs.join(" "));
+    orders.set(session, res.body.paragraphs.join("\u0000"));
   }
   const base = orders.get("s1");
   const differing = others.filter((session) => orders.get(session) !== base);
