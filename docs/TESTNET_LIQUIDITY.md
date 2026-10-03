@@ -109,7 +109,7 @@ your `deployed-testnet.json` manifest and its supply is under your control.
 V2 constant-product mechanics, with the router from §2.2:
 
 1. **Move tokens to the LP wallet.** The deployer (or `LIQUIDITY_WALLET`) holds
-   the 30,000,000 CATT genesis liquidity allocation. Approve the router:
+   the 10,000,000 CATT genesis DEX liquidity allocation. Approve the router:
    `CATT.approve(router, amount)` and `testUSDT.approve(router, amount)`.
 2. **Pick a ratio, not a price.** The genesis supply and the test float only
    exist so the pool can trade; there is no "fair" ratio. A wide, cheap pool

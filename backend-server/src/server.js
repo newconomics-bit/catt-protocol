@@ -88,7 +88,16 @@ const CLAIM_TTL_SECONDS = 600;
 /** Default cap on a request body: 256 KiB is generous for telemetry batches. */
 const BODY_LIMIT = "256kb";
 
-/** How many recent submissions syndicate detection compares against. */
+/**
+ * How many recent submissions syndicate detection compares against — the size
+ * of the CORPUS WINDOW.
+ *
+ * It is a bound, not a tuning knob: a ring can hide outside it, which is
+ * residual risk #2 (lookback evasion) and is unaffected by excluding the
+ * submitter's own submissions, which narrows the window by one ADDRESS's rows
+ * and not by any of the window's other contents. Raising this buys recall at
+ * the cost of a longer scan and more comparisons per submit.
+ */
 const SYNDICATE_LOOKBACK = 50;
 
 /** Error codes this server emits. Clients may switch on them; they never change. */
@@ -575,15 +584,52 @@ function createApp({ store, privateKey, chainId, verifyingContract, logger, rela
     const telemetryOk = anticheat.isTelemetryAcceptable(telemetry);
 
     /* --- 4. Human truth: syndicate detection over RECENT SUBMISSIONS. --- *
-     * The lookup deliberately spans ALL users. A syndicate is a group of     *
-     * submitters copying one another, so a per-user query could not see the  *
-     * copy at all: user B's answer would only ever be compared against      *
-     * B's own history. No entry is excluded for being the current user's   *
-     * own — that is precisely the text an accomplice is imitating.           *
-     * Empty free-texts are dropped: they carry no content and comparing      *
-     * against "" would either always or never match, depending on the        *
-     * implementation.                                                        */
-    const recent = await activeStore.listRecentSubmissions({ limit: SYNDICATE_LOOKBACK });
+     * The corpus spans ALL OTHER USERS, and it is the submitter's OWN rows    *
+     * that are filtered out (residual risk #3).                                *
+     *                                                                          *
+     * Why it still has to be cross-user: a syndicate is a group of submitters  *
+     * copying one another, so a per-user query could never see the copy — user *
+     * B's answer would only ever be compared against B's own history. That is  *
+     * why this is NOT "restrict to other users I have something in common     *
+     * with" and not "restrict to one user": the ring is only visible across    *
+     * accounts.                                                                  *
+     *                                                                          *
+     * Why the submitter's OWN rows are excluded: comparing an answer against    *
+     * the submitter's own earlier answer is a comparison with itself. An       *
+     * honest user who re-mines the same article and writes the same summary    *
+     * twice — which is exactly what a user is told they may do — matched their  *
+     * own text at similarity 1.0 and was refused as a syndicate, with no       *
+     * signature and no claim. That is a false positive with no reading behind  *
+     * it, and it is now closed by the `excludeUserAddress` filter below.        *
+     *                                                                          *
+     * WHAT THE EXCLUSION DOES NOT DO, stated explicitly so nobody mistakes    *
+     * this for a syndicate-detection improvement: the corpus is still a        *
+     * BOUNDED WINDOW of the last SYNDICATE_LOOKBACK submissions. A ring that   *
+     * spaces its copies out past that window, or that paraphrases below the    *
+     * 0.9 Dice threshold, is still undetected — residual risk #2, unchanged,    *
+     * measured in test/red-team.test.js (ATTACK 4d). And a ring of two or more *
+     * DISTINCT addresses loses nothing here: every other member's row is still *
+     * in the corpus, so the copy is still caught (ATTACK 4a/4g).               *
+     *                                                                          *
+     * WHICH ADDRESS IS EXCLUDED: the SUBMITTED `user` — the account being      *
+     * graded — not `msg.sender`. This route has no authenticated caller: it is *
+     * submission-time, and `user` is the identity the verdict, the stored row, *
+     * the nonce and the signed claim all use, so it is the identity whose own  *
+     * history would be self-comparison. Using anything else (a transport-level *
+     * caller identity) would exclude a stranger's history and leave the real   *
+     * submitter's own text in the corpus — reintroducing risk #3 exactly. The  *
+     * gasless relay is claim-time, lives on POST /api/relay, and never reaches  *
+     * this step, so there is no "claim-time caller" to consider. The known     *
+     * consequence of `user` being caller-supplied is recorded separately as    *
+     * residual risk P4 (no proof-of-possession on this route), which this      *
+     * choice neither worsens nor papers over: it is a different defect.        *
+     *                                                                          *
+     * Empty free-texts are dropped: they carry no content and comparing against *
+     * "" would either always or never match, depending on the implementation. */
+    const recent = await activeStore.listRecentSubmissions({
+      excludeUserAddress: user,
+      limit: SYNDICATE_LOOKBACK,
+    });
     const previousTexts = recent
       .map((row) => (typeof row.freeText === "string" ? row.freeText : ""))
       .filter((text) => text.trim() !== "");

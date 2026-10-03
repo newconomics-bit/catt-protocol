@@ -37,6 +37,22 @@ CATT Protocol is a Web3 "Learn-to-Earn" platform built on the Attention Economy.
 *   **Drip Unstaking (Anti-Dump):** Users cannot unstake 100% at once. Max unstake is 10% of staked amount, with an 84-hour (3.5 days) cooldown between requests.
 *   **Real Yield Bonds:** Users can lock $CATT into Bonds (30/90/180 days) to earn yields generated from B2B sponsor revenues, not token inflation.
 
+### 3.4 Token Allocation
+
+The hard cap `MAX_SUPPLY` of **100,000,000 $CATT** is split into a **60,000,000 genesis mint** plus a **40,000,000 mining emission budget** that is minted gradually on-chain, one signed mining reward at a time, by `MiningClaimer`.
+
+| bucket | amount | % of `MAX_SUPPLY` (100M) | % of genesis (60M) |
+|---|---|---|---|
+| Team vesting | 15,000,000 | 15.0% | 25.00% |
+| Treasury | 20,000,000 | 20.0% | 33.33% |
+| Marketing | 15,000,000 | 15.0% | 25.00% |
+| DEX liquidity | 10,000,000 | 10.0% | 16.67% |
+| **genesis total** | **60,000,000** | **60.0%** | **100%** |
+
+Mining headroom is **40,000,000 $CATT** (40% of `MAX_SUPPLY`) and is **never minted at genesis**; it is the emission budget `MiningClaimer` draws from.
+
+The genesis mint is deliberately below `MAX_SUPPLY` because mining claims mint *on top of* genesis: after the genesis allocation, `MiningClaimer` is the sole minter, so a full-cap (100,000,000) genesis mint would leave zero headroom and make **every** claim revert with `MintExceedsMaxSupply`. 60% of the cap is in circulation at genesis, and the remaining 40% is what mining has to live within.
+
 ## 4. TECH STACK ARCHITECTURE
 *   **Mobile Frontend:** Flutter (Cross-platform, optimized for mid-range Android).
 *   **Backend:** Node.js / Express, Supabase (PostgreSQL) for user data.
@@ -116,13 +132,33 @@ These are open defects, not accepted trade-offs. They are recorded here so that 
 
 **5. Concurrent relay race burns relayer gas — OPEN.** Two simultaneous `POST /api/relay` calls for the same nonce BOTH reach the chain: two broadcasts, one settles, one reverts with `ClaimAlreadyUsed`, and the observed HTTP statuses are `[200, 502]`. There is **no double mint** — the contract's `usedNonces` check neutralises the race — but the relayer pays gas for the losing broadcast, and which racer receives the 200 versus the 502 is a coin flip the client cannot distinguish from a genuine failure. The cause is deliberate: the double-relay guard is re-checked *after* the broadcast, so that a connection which dies mid-flight leaves the claim recorded rather than replayable. The fix is a per-nonce in-flight mutex taken before the broadcast; that trade-off must be made deliberately before mainnet, not by accident.
 
-**6. Syndicate detector compares against all submitters, so it both false-positives and evadable — OPEN.** The syndicate check queries the recent-submission corpus with no `userAddress` filter, so the corpus spans ALL submitters including the caller's own history. Two consequences, both measured:
+**6. Syndicate detector: the false positive against an honest repeat submitter is now CLOSED; the evasion is still OPEN.** This item was previously recorded as wholly open and partly of that is now stale. `listRecentSubmissions` has gained an optional `excludeUserAddress` filter, implemented in BOTH the memory adapter (`storage.js`) and the SQLite adapter (`sqlite-store.js`), and `POST /api/submit` now passes the submitted `user` as `excludeUserAddress`. A submitter's OWN submissions are therefore invisible to its own comparison. Three states, each measured:
 
-* A **false positive against an honest user.** One honest user, same article, same summary text, submitted twice, is refused on the second attempt as `SYNDICATE_MATCH` at similarity exactly 1.0, with no signature issued. Writing the same thing twice is punished.
-* **An evasion.** Against a verbatim ring answer, the `>0.9` similarity bar survives word-order permutation, case and punctuation changes, one synonym swap (0.9836), two synonym swaps (0.9677) and one dropped word (0.9831) — but a wholesale rewrite scores 0.1277 and is not caught. Any ring disciplined enough to paraphrase walks straight through. The corpus is also only the last 50 submissions, so a ring that spaces its submits past that window is invisible regardless of wording.
+* **False positive against an honest repeat submitter — CLOSED.** The same account resubmitting identical text now **passes**, with a distinct nonce, instead of being refused on the second attempt as `SYNDICATE_MATCH` at similarity exactly 1.0 with no signature issued. Writing the same thing twice is no longer punished.
+* **Cross-account ring detection — PRESERVED.** Verified: five distinct accounts submitting identical text yield exactly **one** reward issued; the other four are refused. Similarity against the ring is exactly **1.0**. Excluding only the caller's own rows does not weaken the detector, because a syndicate is by definition composed of rows the caller does not own.
+* **Evasion — STILL OPEN.** The `>0.9` similarity bar still survives word-order permutation (**1.0000**), case and punctuation changes (**1.0000**), one synonym swap (**0.9836**), two synonym swaps (**0.9677**) and one dropped word (**0.9831**) — but a wholesale rewrite scores **0.1277** and is not caught. Any ring disciplined enough to paraphrase still walks straight through. The corpus is also still only the last **50** submissions, so a ring that spaces its submits past that window remains invisible regardless of wording.
 
-The per-user filter exists and works when asked for; it is simply not used on the syndicate path, because a syndicate is a group and a per-user query cannot see the copy. Any fix trades one failure mode against the other, and the choice has to be made on evidence rather than left as it stands.
+Excluding the caller's own rows costs an attacker marginally **more** window slots, not fewer: a ring of `k` members sharing a window now occupies `k-1` slots rather than `k`, because no member can see its own row. That is a negligible change and is not a meaningful new attack surface. The 50-row corpus bound is a **pre-existing limitation, not a hole introduced by this fix** — it is unchanged by it. The remaining open decision is how to catch the paraphrasing ring, and that has to be made on evidence rather than left as it stands.
 
 ### Known single-point-of-defence: `staminaCost = 0`
 
-**7. `StakingManager`'s `ZeroAmount` guard is the ONLY defence against a zero-cost claim — OPEN.** A claim whose signed `staminaCost` is `0` is rejected by exactly one check in the entire system: `StakingManager`'s `if (amount == 0) revert ZeroAmount();`. There is no second check anywhere — not in the backend, not in the contract layer above it, not in the claim path — that enforces `staminaCost > 0`. Today the signed `staminaCost` originates from the mission definition and is not attacker-influenced, and an unstaked user cannot settle any reward at all, so this is a defence-in-depth gap rather than a live exploit. But the consequence of the gap opening is severe and silent in the wrong direction: a mission authored with `staminaCost = "0"` in the content file would cause **100% of that mission's claims to revert on-chain**, livelocking every claim for that mission with no partial function and no clear error. A second, independent `staminaCost > 0` validation is required before mainnet.
+**7. `StakingManager`'s `ZeroAmount` guard is the ONLY on-chain defence against a zero-cost claim — CLOSED at the authoring layer, STILL OPEN at the contract layer.** There is now a second, independent `staminaCost > 0` validation, and it runs before a bad mission can ever exist at runtime. `content.js` exports `validateMission` / `validateContent` and a custom `InvalidMissionContent` error whose `.code` is `CONTENT_INVALID_MISSION` (mission) or `CONTENT_INVALID_ARTICLE` (article). Validation runs at **MODULE LOAD** — the final statement of `content.js` is `validateContent({ missions: MISSIONS, articles: ARTICLES })` — and is deliberately **NOT** wrapped in try/catch: a poisoned content file must **crash the Judge at boot** rather than silently serve a mission whose every claim would revert on-chain. Consequently a mission authored with `staminaCost = "0"` can no longer be loaded at all, and the livelock is closed at the authoring layer.
+
+What this does NOT close is the original on-chain single point of defence. `StakingManager`'s `if (amount == 0) revert ZeroAmount();` in `consumeStamina` is still the ONLY contract-level check anywhere in the system that enforces `staminaCost > 0`; there is still no second check in the contract layer above it. Any value that reached the chain by a path other than the backend's validated content file would still pass it. A second, independent `staminaCost > 0` validation at the contract layer remains required before mainnet and is recorded as **OPEN**.
+
+**8. Mission `staminaCost` is denominated in CATT base units while stamina is unitless points — the mining economy cannot currently settle a single claim — OPEN, CRITICAL.**
+
+This is the most severe finding of the wave-8 tokenomics reconciliation. It is a **unit** defect, not a **sign** defect, and it silently disables the entire mining economy. Every one of the following is verifiable in the code:
+
+* `StakingManager`'s own NatSpec states that stamina "is unitless and has no monetary value".
+* `STAMINA_PER_STAKE = 50` stamina **points** are credited per successful `stakeForStamina`.
+* `consumeStamina(account, amount)` requires `amount <= stamina[account]` and otherwise reverts `StaminaInsufficient`.
+* But the three seeded missions in `backend-server/src/content.js` declare `staminaCost` as `1000000000000000000` / `2000000000000000000` / `3000000000000000000` — that is 1, 2 and 3 CATT expressed in **18-decimal base units**, not 1, 2 and 3 stamina points.
+
+The cheapest mission therefore costs `1e18 / 50 = 2e16` successful stakes to cover, and no user can ever accumulate that much stamina. The consequence is unambiguous and total: **realised emission today is 0 CATT/day, no `claimReward` can ever settle, and the entire 40,000,000 mining headroom is completely untouched.** The mining loop described in §6 — submit, sign, claim — is inert.
+
+Note explicitly that the new `staminaCost > 0` validation in `content.js` does **NOT** catch this, and could not: all three values are strictly positive. The defect is the UNIT, not the sign, so a positivity guard is the wrong instrument and the guard passing is **not** evidence of correctness. Item 7's authoring-layer closure must not be read as covering this.
+
+This **invalidates the 40M headroom burn-down projection**. That projection's arithmetic remains valid as a statement about the reward side — what the contract would mint if claims settled — but it is **not a forecast of current behaviour** and must not be quoted as one. The emission schedule decision, including the 40M short-fall discussion, should therefore be **deferred until this unit mismatch is resolved**: fixing it changes how fast stamina is consumed per submission and therefore how fast the headroom drains, so choosing an emission schedule before the burn rate is correct would be choosing it on the wrong number.
+
+The fix lives in `content.js` (backend seed data), **not** in a contract, so it does **not** require unfreezing the frozen contracts. It is nonetheless a tokenomics decision, because it sets the real exchange rate between attention and $CATT. It therefore requires an explicit human decision and is deliberately **not** made unilaterally here.

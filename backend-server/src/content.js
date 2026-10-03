@@ -34,6 +34,26 @@
  * the `ClaimReward` struct in ../signer.js. Use `BigInt(x)` for arithmetic;
  * never rely on Number arithmetic (1e18 exceeds Number.MAX_SAFE_INTEGER).
  *
+ * AUTHORING-TIME VALIDATION (the livelock guard): the seeded content is
+ * validated at MODULE LOAD by `validateContent`, so a mission that could never
+ * settle on-chain is rejected before the module is even exported — long before
+ * anything can be signed. The motivating case is `staminaCost == 0`:
+ * `StakingManager.consumeStamina` reverts `ZeroAmount()` on a zero amount, and
+ * `MiningClaimer.claimReward` calls it unconditionally, so a mission authored
+ * with a zero stamina cost makes 100% of its claims revert while the board
+ * happily lists it and the Judge happily signs it — a silent livelock. The
+ * same class of footgun (bad data that only surfaces as a permanent, silent
+ * failure for the claimant) is guarded for `reward`, `articleId`, `difficulty`,
+ * `minMatches` vs `keySentences` and quiz `correctIndex`.
+ *
+ * A POISONED CONTENT FILE MUST CRASH THE JUDGE AT BOOT. `require`ing this
+ * module with an invalid seed throws from the top level of the module and there
+ * is deliberately NO try/catch anywhere around it: serving a mission that can
+ * never be claimed is strictly worse than not serving it at all, because the
+ * user is invited to read, and then to lose, a reward that was never
+ * claimable. Failing loudly at boot turns an undetectable livelock into a
+ * deploy-time error an operator sees in the first second of the process.
+ *
  * Pure module: no I/O, no clock, no randomness, no environment access.
  */
 
@@ -42,6 +62,27 @@ const DIFFICULTIES = Object.freeze({
   MEDIUM: "MEDIUM",
   HARD: "HARD",
 });
+
+/**
+ * Machine-readable codes attached to content-validation errors, following the
+ * same `*.code` convention as `relay.js`'s `RELAY_ERRORS`: a plain `Error`
+ * with a stable string `.code` plus the offending values as own fields, so a
+ * test or an operator can assert on the code instead of matching a message.
+ *
+ * @type {Readonly<{ INVALID_MISSION: string, INVALID_ARTICLE: string }>}
+ */
+const CONTENT_ERRORS = Object.freeze({
+  /** A mission field is missing, malformed, or would livelock a claim. */
+  INVALID_MISSION: "CONTENT_INVALID_MISSION",
+  /** An article field is missing, malformed, or makes the mission unclaimable. */
+  INVALID_ARTICLE: "CONTENT_INVALID_ARTICLE",
+});
+
+/** The `name` every validation failure carries, so one `instanceof`-free check covers both codes. */
+const CONTENT_ERROR_NAME = "InvalidMissionContent";
+
+/** A non-negative decimal integer, in string form (the amount wire format). */
+const DECIMAL_PATTERN = /^\d+$/;
 
 /**
  * The focus-trap kinds the reading client knows how to render. Exactly one of
@@ -334,6 +375,393 @@ function _deepClone(value) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Authoring-time validation (the livelock guard)                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Builds a content-validation error.
+ *
+ * IDIOM: the codebase has exactly two error idioms — `storage.js` throws a bare
+ * `new Error(message)`, and `relay.js` throws a bare `new Error(message)` with a
+ * stable string `.code` from a frozen `*_ERRORS` map plus the offending values
+ * as own fields (see `_relayError` in relay.js). This factory follows the
+ * SECOND one, because content failures are machine-readable the same way relay
+ * failures are: a named error, a stable `.code`, and the offending values as
+ * fields. It deliberately does not introduce a third idiom (no Error subclass):
+ * `instanceof` across module reloads is a footgun, and `.name` + `.code` is
+ * what every other failure in this codebase is matched on.
+ *
+ * @param {string} code One of `CONTENT_ERRORS`.
+ * @param {string} message Short, secret-free message naming the entity and field.
+ * @param {Object} fields `{ missionId, articleId, field, value, reason }`.
+ * @returns {Error} The typed error.
+ */
+function _contentError(code, message, fields) {
+  const err = new Error(message);
+  err.name = CONTENT_ERROR_NAME;
+  err.code = code;
+  Object.assign(err, fields);
+  return err;
+}
+
+/**
+ * Normalises a value for inclusion in an error field: a bigint would not
+ * survive `JSON.stringify`, so it is carried as its decimal text.
+ *
+ * @param {*} value
+ * @returns {*}
+ */
+function _reportableValue(value) {
+  return typeof value === "bigint" ? value.toString() : value;
+}
+
+/**
+ * True for a STRICTLY POSITIVE integer amount: a positive `bigint`, a safe
+ * integer `number` > 0, or a decimal digit string denoting a value > 0.
+ *
+ * Rejected on purpose: `0` and `"0"` (the livelock: `consumeStamina` reverts
+ * `ZeroAmount`), negative values (`-1`, `"-1"` — a uint256 the ABI encoder
+ * would reject, after the signature had already been issued), fractions
+ * (`1.5`, `"1.5"` — 18-decimal base units cannot be fractional), `NaN`,
+ * `Infinity`, booleans, `null`, `undefined` and objects. Non-finite and unsafe
+ * numbers are rejected because `Number.isSafeInteger` is the only `number`
+ * predicate that survives the 1e18 magnitudes this codebase uses.
+ *
+ * @param {*} value Candidate amount.
+ * @returns {boolean}
+ */
+function _isPositiveAmount(value) {
+  if (typeof value === "bigint") return value > 0n;
+  if (typeof value === "number") return Number.isSafeInteger(value) && value > 0;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!DECIMAL_PATTERN.test(trimmed)) return false;
+    try {
+      return BigInt(trimmed) > 0n;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * Renders an amount for an error message without ever throwing on a Symbol.
+ *
+ * @param {*} value
+ * @returns {string}
+ */
+function _describe(value) {
+  try {
+    return typeof value === "string" ? JSON.stringify(value) : String(value);
+  } catch {
+    return "<unprintable>";
+  }
+}
+
+/**
+ * Validates ONE mission.
+ *
+ * REQUIRED RULE — `staminaCost` must be a strictly positive integer amount.
+ * This is the whole point of the module: a zero stamina cost is signed into
+ * the `ClaimReward` struct by the Judge and then reverts on-chain in
+ * `StakingManager.consumeStamina` (`if (amount == 0) revert ZeroAmount();`,
+ * called unconditionally by `MiningClaimer.claimReward`), which livelocks
+ * 100% of that mission's claims with no user-visible cause. It is checked
+ * FIRST so the error message leads with the required guard.
+ *
+ * EXTRA HARDENING, all of the same class (authored data that fails silently
+ * and permanently rather than loudly):
+ *   - `reward` must be a positive amount. `StakingManager` never rejects a
+ *     zero reward, so a zero-reward mission instead mints signed claims that
+ *     pay nothing — the reader does the work and receives nothing, forever.
+ *   - `articleId` must be a non-empty string that RESOLVES to a real article
+ *     when an article set is supplied. A dangling id makes `getArticleLayout`
+ *     return `null`, so the board lists a mission whose reading material 404s.
+ *   - `difficulty` must be one of `DIFFICULTIES`. It is part of the public
+ *     board projection and of the economy ordering; an unknown value is a
+ *     content bug that no reader can act on.
+ *
+ * The function is PURE: it reads its inputs and throws, it never mutates,
+ * clones, freezes or normalises them. Passing the frozen seed is therefore
+ * safe by construction.
+ *
+ * @param {Object} mission Candidate mission (`{ id, articleId, difficulty, reward, staminaCost }`).
+ * @param {Object} [options]
+ * @param {ReadonlyArray<Object>} [options.articles] Article set to resolve `articleId` against.
+ * @returns {Object} The same `mission` reference, unchanged.
+ * @throws {Error} `CONTENT_INVALID_MISSION` (`InvalidMissionContent`).
+ */
+function validateMission(mission, options) {
+  const articles = options && Array.isArray(options.articles) ? options.articles : null;
+  const fail = (field, reason, value) => {
+    const id = mission && typeof mission.id === "string" ? mission.id : "<missing id>";
+    throw _contentError(
+      CONTENT_ERRORS.INVALID_MISSION,
+      `content: mission \`${id}\` is invalid — field \`${field}\`: ${reason}`,
+      {
+        missionId: id,
+        articleId: mission && typeof mission.articleId === "string" ? mission.articleId : undefined,
+        field,
+        value: _reportableValue(
+          mission && typeof mission === "object" ? mission[field] : value
+        ),
+        reason,
+      }
+    );
+  };
+
+  if (mission === null || typeof mission !== "object" || Array.isArray(mission)) {
+    fail("id", "mission must be an object");
+  }
+  if (typeof mission.id !== "string" || mission.id.length === 0) {
+    fail("id", "mission id must be a non-empty string");
+  }
+
+  // REQUIRED: the livelock guard. First amount check, deliberately.
+  if (!_isPositiveAmount(mission.staminaCost)) {
+    fail(
+      "staminaCost",
+      `must be a strictly positive integer amount in 18-decimal base units, got ${_describe(
+        mission.staminaCost
+      )} — a zero or malformed stamina cost makes every claim revert on-chain with ZeroAmount`,
+      mission.staminaCost
+    );
+  }
+  if (!_isPositiveAmount(mission.reward)) {
+    fail(
+      "reward",
+      `must be a strictly positive integer amount in 18-decimal base units, got ${_describe(
+        mission.reward
+      )} — a zero reward would sign claims that pay nothing`,
+      mission.reward
+    );
+  }
+  if (typeof mission.articleId !== "string" || mission.articleId.length === 0) {
+    fail("articleId", `must be a non-empty string, got ${_describe(mission.articleId)}`, mission.articleId);
+  }
+  if (articles !== null) {
+    const target = articles.find((article) => article && article.id === mission.articleId);
+    if (!target) {
+      fail(
+        "articleId",
+        `\`${mission.articleId}\` does not resolve to a seeded article — the board would list a mission whose reading material 404s`,
+        mission.articleId
+      );
+    }
+  }
+  if (!Object.values(DIFFICULTIES).includes(mission.difficulty)) {
+    fail(
+      "difficulty",
+      `must be one of ${Object.values(DIFFICULTIES).join(", ")}, got ${_describe(mission.difficulty)}`,
+      mission.difficulty
+    );
+  }
+
+  return mission;
+}
+
+/**
+ * Validates ONE article — the content a reader is graded against.
+ *
+ * The article-level rules are the same footgun class as the mission-level ones:
+ * a malformed quiz or highlight task does not crash anything, it just makes
+ * every submission FAIL forever.
+ *   - `quiz[i].correctIndex` must be an integer inside `[0, options.length)`.
+ *     Out of range, the question can never be answered correctly, so
+ *     `QUIZ_INCORRECT` is permanent and the mission pays nothing, ever.
+ *   - `highlightTask.minMatches` must be an integer in
+ *     `[1, keySentences.length]`. Above the key count, `HIGHLIGHT_MISSING` is
+ *     permanent even for a reader who highlighted everything.
+ *   - `quiz`/`keySentences` must be non-empty, `paragraphs` must be non-empty:
+ *     an empty question set or a blank body leaves the reader with nothing to
+ *     answer or nothing to read, and the mission silently pays nothing.
+ *   - `missionId` must resolve to a seeded mission when a mission set is given
+ *     (the mirror of the mission -> article check), `difficulty` must be known,
+ *     and `reward`/`staminaCost` must be positive — the article is what the
+ *     layout serves, so it carries the amounts itself.
+ *
+ * Pure: reads only, never mutates.
+ *
+ * @param {Object} article Candidate article.
+ * @param {Object} [options]
+ * @param {ReadonlyArray<Object>} [options.missions] Mission set to resolve `missionId` against.
+ * @returns {Object} The same `article` reference, unchanged.
+ * @throws {Error} `CONTENT_INVALID_ARTICLE` (`InvalidMissionContent`).
+ */
+function validateArticle(article, options) {
+  const missions = options && Array.isArray(options.missions) ? options.missions : null;
+  const fail = (field, reason, ownerId) => {
+    const id = article && typeof article.id === "string" ? article.id : "<missing id>";
+    throw _contentError(
+      CONTENT_ERRORS.INVALID_ARTICLE,
+      `content: article \`${id}\` is invalid — field \`${field}\`: ${reason}`,
+      {
+        missionId: typeof ownerId === "string" ? ownerId : undefined,
+        articleId: id,
+        field,
+        value: _reportableValue(article && typeof article === "object" ? article[field] : undefined),
+        reason,
+      }
+    );
+  };
+
+  if (article === null || typeof article !== "object" || Array.isArray(article)) {
+    fail("id", "article must be an object");
+  }
+  if (typeof article.id !== "string" || article.id.length === 0) {
+    fail("id", "article id must be a non-empty string");
+  }
+  if (!Object.values(DIFFICULTIES).includes(article.difficulty)) {
+    fail(
+      "difficulty",
+      `must be one of ${Object.values(DIFFICULTIES).join(", ")}, got ${_describe(article.difficulty)}`,
+      article.missionId
+    );
+  }
+  if (!_isPositiveAmount(article.staminaCost)) {
+    fail(
+      "staminaCost",
+      `must be a strictly positive integer amount in 18-decimal base units, got ${_describe(
+        article.staminaCost
+      )} — the layout serves this amount and it becomes the signed claim`,
+      article.missionId
+    );
+  }
+  if (!_isPositiveAmount(article.reward)) {
+    fail(
+      "reward",
+      `must be a strictly positive integer amount in 18-decimal base units, got ${_describe(
+        article.reward
+      )}`,
+      article.missionId
+    );
+  }
+  if (missions !== null && !missions.some((mission) => mission && mission.id === article.missionId)) {
+    fail(
+      "missionId",
+      `\`${_describe(article.missionId)}\` does not resolve to a seeded mission`,
+      article.missionId
+    );
+  }
+  if (!Array.isArray(article.paragraphs) || article.paragraphs.length === 0) {
+    fail("paragraphs", "must be a non-empty array of prose", article.missionId);
+  }
+  for (const paragraph of article.paragraphs) {
+    if (typeof paragraph !== "string" || paragraph.length === 0) {
+      fail("paragraphs", "every paragraph must be a non-empty string", article.missionId);
+    }
+  }
+
+  if (!Array.isArray(article.quiz) || article.quiz.length === 0) {
+    fail("quiz", "must be a non-empty array of questions", article.missionId);
+  }
+  for (const question of article.quiz) {
+    if (!question || typeof question !== "object") {
+      fail("quiz", "every question must be an object", article.missionId);
+    }
+    if (typeof question.id !== "string" || question.id.length === 0) {
+      fail("quiz", "every question needs a non-empty string id", article.missionId);
+    }
+    const options = question.options;
+    if (!Array.isArray(options) || options.length === 0) {
+      fail("quiz", `question \`${question.id}\` must have a non-empty \`options\` array`, article.missionId);
+    }
+    if (
+      !Number.isInteger(question.correctIndex) ||
+      question.correctIndex < 0 ||
+      question.correctIndex >= options.length
+    ) {
+      fail(
+        "quiz",
+        `question \`${question.id}\` has correctIndex ${_describe(
+          question.correctIndex
+        )}, outside [0, ${options.length - 1}] — the question could never be answered correctly`,
+        article.missionId
+      );
+    }
+  }
+
+  const task = article.highlightTask;
+  if (!task || typeof task !== "object") {
+    fail("highlightTask", "must be an object", article.missionId);
+  }
+  if (!Array.isArray(task.keySentences) || task.keySentences.length === 0) {
+    fail("highlightTask", "`keySentences` must be a non-empty array", article.missionId);
+  }
+  for (const key of task.keySentences) {
+    if (typeof key !== "string" || key.length === 0) {
+      fail("highlightTask", "every key sentence must be a non-empty string", article.missionId);
+    }
+  }
+  if (!Number.isInteger(task.minMatches) || task.minMatches < 1) {
+    fail(
+      "highlightTask",
+      `\`minMatches\` must be an integer >= 1, got ${_describe(task.minMatches)}`,
+      article.missionId
+    );
+  }
+  if (task.minMatches > task.keySentences.length) {
+    fail(
+      "highlightTask",
+      `\`minMatches\` ${task.minMatches} exceeds the ${task.keySentences.length} available key sentence(s) — every submission would fail HIGHLIGHT_MISSING forever`,
+      article.missionId
+    );
+  }
+
+  return article;
+}
+
+/**
+ * Validates a whole content set: every mission, then every article, with each
+ * set resolved against the other so the two projections cannot disagree.
+ *
+ * Fails FAST on the first violation (a poisoned file should produce one
+ * precise error at boot, not a list the caller has to correlate).
+ *
+ * Pure: reads only, never mutates, never freezes and never clones.
+ *
+ * @param {Object} content
+ * @param {ReadonlyArray<Object>} content.missions
+ * @param {ReadonlyArray<Object>} content.articles
+ * @returns {{ missions: ReadonlyArray<Object>, articles: ReadonlyArray<Object> }} The same references.
+ * @throws {Error} `CONTENT_INVALID_MISSION` / `CONTENT_INVALID_ARTICLE`.
+ */
+function validateContent(content) {
+  if (!content || typeof content !== "object" || Array.isArray(content)) {
+    throw _contentError(
+      CONTENT_ERRORS.INVALID_MISSION,
+      "content: validateContent({ missions, articles }) requires an object argument",
+      { missionId: undefined, articleId: undefined, field: "content", value: undefined, reason: "argument must be an object" }
+    );
+  }
+  const { missions, articles } = content;
+  if (!Array.isArray(missions)) {
+    throw _contentError(
+      CONTENT_ERRORS.INVALID_MISSION,
+      "content: `missions` must be an array",
+      { missionId: undefined, articleId: undefined, field: "missions", value: undefined, reason: "must be an array" }
+    );
+  }
+  if (!Array.isArray(articles)) {
+    throw _contentError(
+      CONTENT_ERRORS.INVALID_ARTICLE,
+      "content: `articles` must be an array",
+      { missionId: undefined, articleId: undefined, field: "articles", value: undefined, reason: "must be an array" }
+    );
+  }
+
+  for (const mission of missions) {
+    validateMission(mission, { articles });
+  }
+  for (const article of articles) {
+    validateArticle(article, { missions });
+  }
+
+  return { missions, articles };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Seeded PRNG (the reproducibility contract)                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -416,6 +844,27 @@ const MISSIONS = _deepFreeze(_MISSIONS_SEED);
 
 /** @type {ReadonlyArray<Object>} Frozen seed: the full articles. */
 const ARTICLES = _deepFreeze(_ARTICLES_SEED);
+
+/**
+ * AUTHORING-TIME GUARD, RUN AT MODULE LOAD.
+ *
+ * The frozen seed is validated here, at the top level of the module, BEFORE
+ * `module.exports` is reached. A mission that could livelock its own claims is
+ * therefore not loadable, let alone signable: `require("content.js")` throws
+ * and the Judge never boots.
+ *
+ * This throw is DELIBERATELY NOT CAUGHT. There is no try/catch anywhere around
+ * this call and there must never be one: a poisoned content file must crash
+ * the Judge at boot rather than silently serve a mission whose every claim
+ * reverts on-chain with `ZeroAmount()`. The cost of a loud crash is an operator
+ * fixing a constant; the cost of swallowing it is an indefinite, invisible
+ * livelock on the bounty board.
+ *
+ * Validation is read-only, so running it against the frozen seed cannot mutate
+ * or unfreeze anything, and it never touches the PRNG: `getArticleLayout` is
+ * byte-identical to before this guard existed.
+ */
+validateContent({ missions: MISSIONS, articles: ARTICLES });
 
 /**
  * Lists the bounty board. Returns a deep copy so the caller can filter/sort
@@ -520,10 +969,16 @@ function getArticleLayout(articleId, sessionId) {
 module.exports = {
   DIFFICULTIES,
   FOCUS_TRAP_TYPES,
+  CONTENT_ERRORS,
+  CONTENT_ERROR_NAME,
   MISSIONS,
   ARTICLES,
   listMissions,
   getMission,
   getArticle,
   getArticleLayout,
+  // Authoring-time validation (the livelock guard).
+  validateContent,
+  validateMission,
+  validateArticle,
 };

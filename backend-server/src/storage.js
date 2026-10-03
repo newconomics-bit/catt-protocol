@@ -65,7 +65,40 @@
  *     details      jsonb
  *   )
  *   CREATE INDEX submissions_recent ON submissions (submitted_at DESC);
- *   -- listRecentSubmissions() is exactly this index, newest first.
+ *   CREATE INDEX submissions_user_recent ON submissions (user_address, submitted_at DESC);
+ *   -- listRecentSubmissions() is this index, newest first, plus a predicate:
+ *   --
+ *   --   user_address = $2             (the `userAddress` filter: ONLY that user)
+ *   --   user_address <> $3             (the `excludeUserAddress` filter: everyone
+ *   --                                 BUT that user — see the note below)
+ *   --
+ *   -- `submissions_recent` serves the unfiltered syndicate corpus: the
+ *   -- `submitted_at DESC` prefix supplies the ORDER BY and, together with the
+ *   -- LIMIT, bounds the scan. The `<>` predicate is a FILTER over that window,
+ *   -- not a seek, so it deliberately does not change which index answers the
+ *   -- query; `submissions_user_recent` is the index that lets the per-user
+ *   -- form (`user_address = $2`) seek instead of scan. Both filters together
+ *   -- keep only rows that satisfy both, which is exactly one address when the
+ *   -- two differ and nothing at all when they are the same.
+ *   --
+ *   -- THE `excludeUserAddress` PREDICATE EXISTS FOR RESIDUAL RISK #3, AND IT
+ *   -- DOES NOT CLOSE RESIDUAL RISK #2. Before it existed, the syndicate corpus
+ *   -- spanned all users INCLUDING the submitter's own earlier submissions, so
+ *   -- an honest user who re-mined an article and wrote the same summary twice
+ *   -- was compared against their own text, matched at similarity 1.0, and
+ *   -- refused as a syndicate. That is a false positive against an honest user
+ *   -- and it is now closed.
+ *   --
+ *   -- What is NOT closed by it: the corpus is still a BOUNDED RECENT WINDOW
+ *   -- (SYNDICATE_LOOKBACK = 50 submissions in `server.js`, the default limit
+ *   -- here). A ring that waits for its copies to age out of that window, or
+ *   -- that paraphrases past the 0.9 Dice threshold, is still undetected — the
+ *   -- measurements for that are pinned in test/red-team.test.js (ATTACK 4d)
+ *   -- and are unchanged by this predicate. Excluding one submitter's own rows
+ *   -- widens the ring-detection footprint by nothing and narrows it by nothing:
+ *   -- a ring of two or more DISTINCT addresses is still visible in full to
+ *   -- every member after its own rows are removed. Do not read this index
+ *   -- change as a paraphrase or lookback fix.
  *
  *   issued_claims(
  *     user_address text NOT NULL,
@@ -192,6 +225,31 @@ function clone(value) {
   const out = {};
   for (const key of Object.keys(value)) out[key] = clone(value[key]);
   return out;
+}
+
+/**
+ * Canonical comparison form of an address filter: lowercase text, or `null` for
+ * "no filter".
+ *
+ * `listRecentSubmissions` compares addresses with `===`, and `0xAbC…` and
+ * `0xabc…` are the same wallet — the same reason `claimKey` lowercases its key.
+ * Without this, an honest user who submits once with a checksummed address and
+ * once with the lowercase form would have their own earlier text back in their
+ * own corpus (the exclusive filter would miss), which is exactly residual risk
+ * #3 reappearing through casing.
+ *
+ * ABSENT IS `null`, and so is anything that cannot be an address (`""`, a
+ * whitespace-only string). A blank filter must mean "do not filter", never
+ * "match nothing": the syndicate corpus asking for "everyone except ''" must
+ * still get everyone.
+ *
+ * @param {*} value Candidate address, or an absent/null filter.
+ * @returns {string|null} Lowercase address, or `null` for "no filter".
+ */
+function _addressScope(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim().toLowerCase();
+  return text === "" ? null : text;
 }
 
 /**
@@ -413,31 +471,107 @@ function createMemoryStore() {
     },
 
     /**
-     * Lists recent submissions, NEWEST FIRST.
+     * Lists recent submissions, NEWEST FIRST, optionally filtered by address.
      *
-     * When `userAddress` is supplied the list is scoped to that user;
-     * when it is omitted the list spans ALL users, which is the mode syndicate
-     * detection needs — a syndicate is a *group* of submitters copying each
-     * other, so a per-user query can never see the copy. A per-user scope is
-     * offered only for debugging and for any future "my submission history"
-     * mobile screen.
+     * TWO INDEPENDENT, COMPOSABLE FILTERS, both applied to the SAME
+     * newest-first ordering:
      *
-     * Postgres: `SELECT * FROM submissions ORDER BY submitted_at DESC, id DESC
-     * LIMIT $1`, optionally `WHERE user_address = $2`. Ordering by `id DESC`
-     * as a tiebreaker keeps the order total and deterministic when several
+     *   `userAddress`         INCLUSIVE  — "ONLY this user". Offered for
+     *                                    debugging and for a future "my
+     *                                    submission history" screen. NOT the
+     *                                    syndicate mode on its own: a syndicate
+     *                                    is a GROUP of submitters copying each
+     *                                    other, and a per-user query can never
+     *                                    see the copy.
+     *
+     *   `excludeUserAddress`  EXCLUSIVE  — "everyone BUT this user". This is
+     *                                    the syndicate corpus: the recent
+     *                                    submissions of OTHER users. It exists
+     *                                    for RESIDUAL RISK #3, the self-
+     *                                    comparison false positive. With only
+     *                                    the inclusive filter available, the
+     *                                    syndicate path either (a) kept the
+     *                                    submitter's own earlier rows in the
+     *                                    corpus and refused an honest user who
+     *                                    wrote the same summary twice
+     *                                    (similarity 1.0 against themselves), or
+     *                                    (b) restricted the corpus to the
+     *                                    submitter alone and saw no ring at all.
+     *                                    Neither is acceptable, so the corpus is
+     *                                    the cross-user window MINUS ONE
+     *                                    ADDRESS — not "other users I share
+     *                                    something with", and not "one user".
+     *
+     * THE FOUR COMBINATIONS, all independent and all meaningful:
+     *
+     *   neither              EVERY user. The pre-existing behaviour, and the
+     *                         one the relay path and any future admin view
+     *                         depend on. Unchanged.
+     *   `userAddress` only   ONLY that user.
+     *   `excludeUserAddress` EVERY user except that one. The syndicate case.
+     *   BOTH, and the two
+     *   addresses DIFFER     ONLY `userAddress`, and the exclusion is then a
+     *                         no-op because no row can be both. Returned as
+     *                         that user's rows.
+     *   BOTH, and the two
+     *   addresses are EQUAL  DEGENERATE, and it returns NOTHING. "Only this
+     *                         user, but not this user" is the empty set; it is
+     *                         NOT silently downgraded to "only this user" (that
+     *                         would quietly turn a caller's intent inside out)
+     *                         and NOT silently dropped (that would return
+     *                         everyone, the one interpretation that leaks the
+     *                         very history the caller excluded). Callers that
+     *                         want one user's rows must not pass the same
+     *                         address as both filters.
+     *
+     * ADDRESSES ARE COMPARED CASE-INSENSITIVELY, like `claimKey` above and
+     * unlike the raw `===` a naive implementation would use. An honest user
+     * who submits once with a checksummed address and once with the lowercase
+     * form is the SAME wallet, and a case-sensitive exclusion would let their
+     * own earlier text back into their own corpus — which is precisely the
+     * false positive this parameter exists to remove, reintroduced through
+     * address casing.
+     *
+     * `limit` is applied AFTER filtering, so it always counts rows the caller
+     * actually receives: excluding the submitter's own rows never silently
+     * shrinks the window from 50 to fewer. A submission row with no recorded
+     * address (`userAddress === null`) belongs to nobody and is therefore kept
+     * by the exclusive filter and dropped by the inclusive one, in both
+     * adapters.
+     *
+     * THE EXCLUSION DOES NOT CLOSE RESIDUAL RISK #2. The corpus is still a
+     * BOUNDED RECENT WINDOW (50 submissions), so the paraphrase and
+     * lookback-evasion weakness measured in `test/red-team.test.js` (ATTACK 4d)
+     * survives this parameter unchanged, and a ring of two or more distinct
+     * addresses is still fully visible to every member after its own rows are
+     * removed. This is a false-positive fix, not a syndicate-detection fix.
+     *
+     * Postgres:
+     * `SELECT * FROM submissions [WHERE user_address = $2] [AND user_address <> $3]
+     *  ORDER BY submitted_at DESC, id DESC LIMIT $1`. Ordering by `id DESC` as a
+     * tiebreaker keeps the order total and deterministic when several
      * submissions land inside one clock tick.
      *
      * @param {Object} [params]
-     * @param {string} [params.userAddress Restrict to one wallet; omit for all users.
-     * @param {number} [params.limit] Maximum rows; defaults to 50.
+     * @param {string} [params.userAddress INCLUSIVE filter: ONLY this wallet.
+     * @param {string} [params.excludeUserAddress EXCLUSIVE filter: everyone but
+     *   this wallet. The syndicate corpus. See the four combinations above.
+     * @param {number} [params.limit] Maximum rows AFTER filtering; defaults to 50.
      * @returns {Promise<Array<Object>>} Newest-first submission records.
      */
-    async listRecentSubmissions({ userAddress, limit } = {}) {
+    async listRecentSubmissions({ userAddress, excludeUserAddress, limit } = {}) {
       const max = Number.isInteger(limit) && limit > 0 ? limit : 50;
+      const include = _addressScope(userAddress);
+      const exclude = _addressScope(excludeUserAddress);
       const scoped =
-        userAddress === undefined || userAddress === null
+        include === null && exclude === null
           ? submissionOrder
-          : submissionOrder.filter((row) => row.userAddress === userAddress);
+          : submissionOrder.filter((row) => {
+              const who = _addressScope(row.userAddress);
+              if (include !== null && who !== include) return false;
+              if (exclude !== null && who === exclude) return false;
+              return true;
+            });
       return scoped.slice(0, max).map(clone);
     },
 
