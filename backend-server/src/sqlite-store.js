@@ -89,12 +89,93 @@
  *          callers verbatim).
  *     The load order, inside ONE transaction, with foreign keys deferred until
  *     the end: `sessions` → `telemetry` → `submissions` → `nonce_counters` →
- *     `issued_claims`. Nothing in `issued_claims` is needed to interpret
+ *     `issued_claims` → `stamina_ledger` → `streaks` →
+ *     `daily_active_miners` → `free_stamina_grants` → `seasons` →
+ *     `season_claims`. The first five have no back-edges; the growth tables
+ *     depend on nothing but the addresses the caller supplies, so appending them
+ *     is safe. Nothing in `issued_claims` is needed to interpret
  *     anything in `submissions`, so the order has no back-edges. Because
  *     `user_address` is stored LOWERCASE here (see below), Postgres must
  *     receive lowercase too or the unique constraints stop lining up with the
  *     rows the Judge already issued; `citext`/lowercase normalisation on the
  *     application side is what keeps `getIssuedClaim` case-insensitive there.
+ *
+ *     (e) POSTGRES DDL FOR THE GROWTH LEDGERS (migrations 2 and 3 below)
+ *     Same tables, same constraints, two type widenings and one naming change:
+ *
+ *       stamina_ledger(               -- per-day stamina SPENT (not a balance)
+ *         user_address text NOT NULL,
+ *         day_key      date   NOT NULL,   -- SQLite: TEXT 'YYYY-MM-DD'
+ *         consumed     numeric NOT NULL,  -- TEXT here; see precision note
+ *         updated_at   bigint  NOT NULL,  -- INTEGER ms here
+ *         PRIMARY KEY (user_address, day_key)
+ *       );
+ *       CREATE INDEX stamina_ledger_day ON stamina_ledger (day_key);
+ *
+ *       streaks(                      -- ONE row per user; no cap stored here
+ *         user_address    text PRIMARY KEY NOT NULL,
+ *         current_streak  integer NOT NULL,
+ *         last_graded_day date,
+ *         last_reward     numeric,
+ *         last_mission_id text
+ *       );
+ *       CREATE INDEX streaks_last_graded_day ON streaks (last_graded_day);
+ *
+ *       daily_active_miners(          -- the countActiveMiners ledger
+ *         day_key      date   NOT NULL,
+ *         user_address text NOT NULL,
+ *         PRIMARY KEY (day_key, user_address)
+ *       );
+ *       CREATE INDEX daily_active_miners_day ON daily_active_miners (day_key);
+ *
+ *       free_stamina_grants(          -- per-day grants; day isolation is the PK
+ *         user_address text NOT NULL,
+ *         day_key      date   NOT NULL,
+ *         granted      numeric NOT NULL,
+ *         updated_at   bigint  NOT NULL,
+ *         PRIMARY KEY (user_address, day_key)
+ *       );
+ *
+ *       seasons(
+ *         id         text PRIMARY KEY NOT NULL,
+ *         start_at   bigint  NOT NULL,  -- unix seconds, INCLUSIVE
+ *         end_at     bigint,            -- unix seconds, EXCLUSIVE; NULL = open-ended
+ *         allocation numeric NOT NULL,  -- 18-decimal CATT
+ *         claim_mode text
+ *       );
+ *       CREATE INDEX seasons_window ON seasons (start_at DESC, id ASC);
+ *       -- getActiveSeason is
+ *       --   SELECT * FROM seasons
+ *       --    WHERE start_at <= $1 AND (end_at IS NULL OR end_at > $1)
+ *       --    ORDER BY start_at DESC, id ASC LIMIT 1;
+ *       -- i.e. [start, end) with LATEST-start-wins overlap resolution and a
+ *       -- deterministic id tiebreak. In Postgres the same ORDER BY is served by
+ *       -- `seasons_window`; note that `start_at DESC, id ASC` is a mixed
+ *       -- direction index, which Postgres can use for this exact ORDER BY but
+ *       -- not for a bare `start_at` range scan — add a second index on
+ *       -- (start_at) if an operator query ever needs one.
+ *
+ *       season_claims(
+ *         season_id   text   NOT NULL,
+ *         user_address text  NOT NULL,
+ *         nonce       numeric NOT NULL,  -- TEXT here: idempotency, not a counter
+ *         amount      numeric NOT NULL,
+ *         claimed_at  bigint  NOT NULL,
+ *         PRIMARY KEY (season_id, user_address, nonce)
+ *       );
+ *       CREATE INDEX season_claims_season ON season_claims (season_id);
+ *
+ *     The type widenings, as above: `consumed`/`granted`/`allocation`/`amount`/
+ *     `nonce` are TEXT here and `numeric(78,0)` in Postgres — load with
+ *     `::numeric`, NOT `::bigint`; `updated_at`/`claimed_at` are INTEGER
+ *     milliseconds here and `bigint` there; `day_key` is a `date` in Postgres
+ *     (the TEXT 'YYYY-MM-DD' here is already exactly that literal form, so the
+ *     import is a direct cast). Load order for the growth tables is
+ *     `stamina_ledger`, `streaks`, `daily_active_miners`,
+ *     `free_stamina_grants`, `seasons`, `season_claims` — there are no foreign
+ *     keys among them by design: a claim row that outlives its season row is
+ *     still a real historical fact, and a foreign key would make season deletion
+ *     a data-loss operation.
  *
  *     (d) NO MIGRATION FROM THE IN-MEMORY STORE IS POSSIBLE OR NEEDED
  *     The in-memory store is volatile by definition: it holds everything in two
@@ -115,7 +196,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { STORAGE_METHODS, assertStoreShape } = require("./storage");
+const { STORAGE_METHODS, assertStoreShape, normalizeDayKey, isNextDayAfter } = require("./storage");
 
 /**
  * The schema version this build of the code creates and understands. Stored in
@@ -123,7 +204,7 @@ const { STORAGE_METHODS, assertStoreShape } = require("./storage");
  *
  * @type {number}
  */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 3;
 
 /**
  * The default database path used when `CATT_STORE=sqlite` and `SQLITE_PATH` is
@@ -288,6 +369,153 @@ const MIGRATIONS = Object.freeze([
       `);
     },
   },
+  {
+    version: 2,
+    /**
+     * The per-day growth ledgers: stamina SPENT, streaks, and free-stamina
+     * grants, plus the daily active-miner set.
+     *
+     * Pure ADDITIVE DDL: new tables, new indexes, no column added to or changed
+     * on any existing table, so applying this to a live v1 file is a pure append
+     * and a rollback is "open a file that predates it". Every statement is
+     * `IF NOT EXISTS`, which is what makes re-running the whole migration list
+     * (a fresh `init()`, a re-open, a re-run after a crash) a no-op instead of an
+     * error.
+     *
+     * THE PRIMARY KEYS ARE THE CONSTRAINTS, NOT A CONVENTION. Every one of these
+     * tables is "one row per key", so the key IS the primary key and a duplicate
+     * insert is refused by SQLite itself — the test suite proves that with raw
+     * SQL, bypassing this adapter entirely. `day_key` is TEXT 'YYYY-MM-DD' (see
+     * the header note): a caller-supplied string, never derived from a timestamp
+     * in here.
+     *
+     * @param {Object} db An open `better-sqlite3` database.
+     * @returns {void}
+     */
+    up(db) {
+      db.exec(`
+        -- Per-day stamina SPENT by one user. NOT a balance: stamina lives
+        -- on-chain in StakingManager.stamina, and this table only answers "how
+        -- much did this wallet spend today", which is what the daily cap is
+        -- re-derived from. Accumulated in JS (BigInt) and written whole, so two
+        -- concurrent spends cannot lose a delta to a read-modify-write race in
+        -- application code — the transaction plus the upsert is the guard.
+        -- consumed is TEXT for the out-of-range reason in the header note.
+        CREATE TABLE IF NOT EXISTS stamina_ledger (
+          user_address TEXT NOT NULL,
+          day_key      TEXT NOT NULL,
+          consumed     TEXT NOT NULL,
+          updated_at   INTEGER NOT NULL,
+          -- NOT NULL is spelled out on every TEXT key because of a SQLite quirk:
+          -- a TEXT PRIMARY KEY does NOT imply NOT NULL (only an INTEGER PRIMARY
+          -- KEY does), and a NULL key would let every NULL address share one
+          -- bucket per day.
+          PRIMARY KEY (user_address, day_key)
+        );
+        CREATE INDEX IF NOT EXISTS stamina_ledger_day
+          ON stamina_ledger (day_key);
+
+        -- ONE row per user. current_streak is a plain day COUNT (INTEGER is
+        -- ample and it is a count, not an amount), and NO CAP IS STORED: capping
+        -- is economic policy owned by another module and belongs at read time,
+        -- because a cap applied here would be baked into rows already written.
+        -- last_reward/last_mission_id are the audit trail of the last graded
+        -- completion; they are deliberately not part of the streak VIEW.
+        CREATE TABLE IF NOT EXISTS streaks (
+          user_address    TEXT PRIMARY KEY NOT NULL,
+          current_streak  INTEGER NOT NULL,
+          last_graded_day TEXT,
+          last_reward     TEXT,
+          last_mission_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS streaks_last_graded_day
+          ON streaks (last_graded_day);
+
+        -- The daily active-miner LEDGER, one row per (day, user). It exists as
+        -- its own table rather than as a projection of streaks because a streak
+        -- row holds only the user's LATEST graded day: deriving yesterday's count
+        -- from it would shrink as soon as the same user completed something
+        -- today. Written with INSERT OR IGNORE, so re-recording a completion in
+        -- the same day is idempotent and the primary key is what makes it so.
+        -- countActiveMiners is a COUNT(*) over day_key = ?, served
+        -- by daily_active_miners_day: an index-only count over one day's rows,
+        -- with no table scan and no clock read.
+        CREATE TABLE IF NOT EXISTS daily_active_miners (
+          day_key      TEXT NOT NULL,
+          user_address TEXT NOT NULL,
+          PRIMARY KEY (day_key, user_address)
+        );
+        CREATE INDEX IF NOT EXISTS daily_active_miners_day
+          ON daily_active_miners (day_key);
+
+        -- Per-day FREE stamina grants. Same shape and same day-isolation
+        -- guarantee as stamina_ledger: a grant made on day A is unreachable from
+        -- day B, because the key is (user, day) and never user alone.
+        CREATE TABLE IF NOT EXISTS free_stamina_grants (
+          user_address TEXT NOT NULL,
+          day_key      TEXT NOT NULL,
+          granted      TEXT NOT NULL,
+          updated_at   INTEGER NOT NULL,
+          PRIMARY KEY (user_address, day_key)
+        );
+        CREATE INDEX IF NOT EXISTS free_stamina_grants_day
+          ON free_stamina_grants (day_key);
+      `);
+    },
+  },
+  {
+    version: 3,
+    /**
+     * Seasons and their claims.
+     *
+     * `seasons.start_at`/`end_at` are unix SECONDS, start-INCLUSIVE and
+     * end-EXCLUSIVE, with `end_at IS NULL` meaning an OPEN-ENDED season. That
+     * half-open window is what makes back-to-back seasons well defined: with both
+     * ends inclusive the closing second of season N would also be the opening
+     * second of season N+1 and a claim landing there would have two owners.
+     *
+     * `seasons_window (start_at DESC, id ASC)` is not decoration — it is the
+     * exact ORDER BY of getActiveSeason, whose overlap rule is "the candidate
+     * with the LATEST start wins, ties broken by id ascending". Overlapping
+     * windows are an operator mistake rather than a design, and resolving them by
+     * row order instead would make an allocation depend on insertion order.
+     *
+     * `season_claims` is keyed by (season_id, user_address, nonce) because `nonce`
+     * is part of the claim's IDENTITY, not decoration: one user claims many times
+     * in a season, and the nonce is what makes a retried request idempotent
+     * instead of accruing twice. There are deliberately NO FOREIGN KEYS among the
+     -- growth tables: a claim row that outlives its season row is a real
+     -- historical fact, and a foreign key would turn season deletion into data
+     * loss.
+     *
+     * @param {Object} db An open `better-sqlite3` database.
+     * @returns {void}
+     */
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS seasons (
+          id         TEXT PRIMARY KEY NOT NULL,
+          start_at   INTEGER NOT NULL,
+          end_at     INTEGER,
+          allocation TEXT NOT NULL,
+          claim_mode TEXT
+        );
+        CREATE INDEX IF NOT EXISTS seasons_window
+          ON seasons (start_at DESC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS season_claims (
+          season_id   TEXT NOT NULL,
+          user_address TEXT NOT NULL,
+          nonce       TEXT NOT NULL,
+          amount      TEXT NOT NULL,
+          claimed_at  INTEGER NOT NULL,
+          PRIMARY KEY (season_id, user_address, nonce)
+        );
+        CREATE INDEX IF NOT EXISTS season_claims_season
+          ON season_claims (season_id);
+      `);
+    },
+  },
 ]);
 
 /* ------------------------------------------------------------------------ *
@@ -311,6 +539,16 @@ const MIGRATIONS = Object.freeze([
  *   `deadline` and `nonce` are stored as TEXT too — deadlines are unix seconds
  *   today but are uint256 in the signed struct, so they get the same treatment
  *   rather than a special case that a future change would have to remember.
+ *
+ *   THE GROWTH LEDGERS FOLLOW THE SAME RULE WHERE IT COSTS NOTHING:
+ *   `consumed`, `granted`, `allocation`, `amount` and the season-claim `nonce`
+ *   are all TEXT, all returned as canonical decimal strings, for the same
+ *   out-of-range reason — a season allocation is 18-decimal CATT and a running
+ *   total that rounds is a total that can exceed the very allocation it is meant
+ *   to be bounded by. Stamina POINTS themselves are single-digit integers (see
+ *   the unit note in `content.js`), but the ledger that SUMS them is stored as
+ *   text anyway: a counter that silently rounds above 2^53 is a counter that
+ *   lies, and the cost of being exact is one `toDecimalText` call.
  *
  * WHY ADDRESSES ARE LOWERCASE:
  *   One form, always. `storage.js` already made issued-claim LOOKUPS
@@ -608,6 +846,80 @@ function createSqliteStore({ filename, logger, createDirectory } = {}) {
       `UPDATE issued_claims SET relayed_tx_hash = @txHash, relayed_at = @relayedAt
         WHERE user_address = @userAddress AND nonce = @nonce AND relayed_tx_hash IS NULL`
     ),
+
+    /* --- growth ledgers ------------------------------------------------- */
+
+    selectStaminaConsumed: db.prepare(
+      "SELECT consumed FROM stamina_ledger WHERE user_address = ? AND day_key = ?"
+    ),
+    upsertStaminaConsumption: db.prepare(
+      `INSERT INTO stamina_ledger (user_address, day_key, consumed, updated_at)
+         VALUES (@userAddress, @dayKey, @consumed, @updatedAt)
+       ON CONFLICT (user_address, day_key) DO UPDATE SET consumed = excluded.consumed, updated_at = excluded.updated_at`
+    ),
+    selectStreak: db.prepare(
+      "SELECT current_streak, last_graded_day FROM streaks WHERE user_address = ?"
+    ),
+    upsertStreak: db.prepare(
+      `INSERT INTO streaks (user_address, current_streak, last_graded_day, last_reward, last_mission_id)
+         VALUES (@userAddress, @currentStreak, @lastGradedDay, @lastReward, @lastMissionId)
+       ON CONFLICT (user_address) DO UPDATE SET
+         current_streak  = excluded.current_streak,
+         last_graded_day = excluded.last_graded_day,
+         last_reward     = excluded.last_reward,
+         last_mission_id = excluded.last_mission_id`
+    ),
+    markActiveMiner: db.prepare(
+      "INSERT OR IGNORE INTO daily_active_miners (day_key, user_address) VALUES (?, ?)"
+    ),
+    countActiveMiners: db.prepare(
+      "SELECT COUNT(*) AS total FROM daily_active_miners WHERE day_key = ?"
+    ),
+    selectFreeStaminaGranted: db.prepare(
+      "SELECT granted FROM free_stamina_grants WHERE user_address = ? AND day_key = ?"
+    ),
+    upsertFreeStaminaGrant: db.prepare(
+      `INSERT INTO free_stamina_grants (user_address, day_key, granted, updated_at)
+         VALUES (@userAddress, @dayKey, @granted, @updatedAt)
+       ON CONFLICT (user_address, day_key) DO UPDATE SET granted = excluded.granted, updated_at = excluded.updated_at`
+    ),
+    selectSeason: db.prepare("SELECT id, start_at, end_at, allocation, claim_mode FROM seasons WHERE id = ?"),
+    upsertSeason: db.prepare(
+      `INSERT INTO seasons (id, start_at, end_at, allocation, claim_mode)
+         VALUES (@id, @startAt, @endAt, @allocation, @claimMode)
+       ON CONFLICT (id) DO UPDATE SET
+         start_at = excluded.start_at, end_at = excluded.end_at,
+         allocation = excluded.allocation, claim_mode = excluded.claim_mode`
+    ),
+    // `[start, end)` with LATEST-start-wins overlap resolution and an `id ASC`
+    // tiebreak — the index `seasons_window (start_at DESC, id ASC)` matches this
+    // ORDER BY exactly, and `end_at IS NULL` is the open-ended season.
+    selectActiveSeason: db.prepare(
+      `SELECT id, start_at, end_at, allocation, claim_mode
+         FROM seasons
+        WHERE start_at <= ? AND (end_at IS NULL OR end_at > ?)
+        ORDER BY start_at DESC, id ASC
+        LIMIT 1`
+    ),
+    selectSeasonClaim: db.prepare(
+      "SELECT amount FROM season_claims WHERE season_id = ? AND user_address = ? AND nonce = ?"
+    ),
+    insertSeasonClaim: db.prepare(
+      `INSERT INTO season_claims (season_id, user_address, nonce, amount, claimed_at)
+         VALUES (@seasonId, @userAddress, @nonce, @amount, @claimedAt)`
+    ),
+    // Season and per-user totals are SUMMED IN JAVASCRIPT as BigInt, not with
+    // SQL `SUM()`. SQLite's SUM() coerces a TEXT column to a double, which is
+    // exactly the rounding the TEXT columns exist to prevent — a total computed
+    // that way could exceed the allocation it is meant to be bounded by. Both
+    // queries are index-served by `season_claims_season` /
+    // the (season_id, user_address, nonce) primary key.
+    selectSeasonClaimAmounts: db.prepare(
+      "SELECT amount FROM season_claims WHERE season_id = ?"
+    ),
+    selectUserClaimAmounts: db.prepare(
+      "SELECT amount FROM season_claims WHERE season_id = ? AND user_address = ?"
+    ),
   };
 
   /* --- row -> view mappers --------------------------------------------- */
@@ -668,6 +980,81 @@ function createSqliteStore({ filename, logger, createDirectory } = {}) {
   }
 
   let closed = false;
+
+  /* --- growth-ledger helpers ------------------------------------------- */
+
+  /**
+   * Exact `bigint` of a non-negative integer amount, from whatever the caller
+   * passed. Same acceptance rules as the memory store's `toExactAmount`, so the
+   * two adapters agree on what a valid amount is.
+   *
+   * @param {*} value Candidate amount.
+   * @param {string} label Field name for the error message.
+   * @returns {bigint}
+   * @throws {TypeError} If `value` is not a non-negative integer amount.
+   */
+  function exactAmount(value, label) {
+    if (value === null || value === undefined) {
+      throw new TypeError(`${label} is required and must be a non-negative integer amount.`);
+    }
+    if (typeof value === "bigint") {
+      if (value < 0n) throw new TypeError(`${label} must not be negative, got ${value}.`);
+      return value;
+    }
+    if (typeof value === "number") {
+      if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+        throw new TypeError(`${label} must be a non-negative integer amount, got ${String(value)}.`);
+      }
+      return BigInt(value);
+    }
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+      return BigInt(value.trim());
+    }
+    throw new TypeError(`${label} must be a non-negative integer amount, got ${JSON.stringify(value)}.`);
+  }
+
+  /**
+   * Sum of a season's claimed amounts, exactly.
+   *
+   * @param {string} seasonId Season id.
+   * @returns {bigint}
+   */
+  function seasonTotal(seasonId) {
+    let total = 0n;
+    for (const row of stmt.selectSeasonClaimAmounts.all(seasonId)) {
+      total += BigInt(row.amount);
+    }
+    return total;
+  }
+
+  /**
+   * Sum of ONE user's claimed amounts in a season, exactly.
+   *
+   * @param {string} seasonId Season id.
+   * @param {string} userAddress Lowercased wallet address.
+   * @returns {bigint}
+   */
+  function userAccrued(seasonId, userAddress) {
+    let total = 0n;
+    for (const row of stmt.selectUserClaimAmounts.all(seasonId, userAddress)) {
+      total += BigInt(row.amount);
+    }
+    return total;
+  }
+
+  /**
+   * @param {Object} row A `seasons` row.
+   * @returns {Object} The season view the memory store returns.
+   */
+  function toSeason(row) {
+    return {
+      id: row.id,
+      start: Number(row.start_at),
+      end: row.end_at === null ? null : Number(row.end_at),
+      allocation: row.allocation,
+      claimMode: row.claim_mode,
+    };
+  }
 
   const store = {
     /**
@@ -1053,6 +1440,314 @@ function createSqliteStore({ filename, logger, createDirectory } = {}) {
         return false;
       })();
       return mark;
+    },
+
+    /* ------------------------------------------------------------------ *
+     * Growth ledgers. Pure mechanics, caller-supplied day keys, no clock  *
+     * and no economics. The full specification of every method below is   *
+     * in `storage.js`, which both adapters implement verbatim.            *
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Stamina SPENT by one user on one UTC day, as a canonical decimal string.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @returns {Promise<{ userAddress: string, dayKey: string, consumed: string }>}
+     */
+    async getStaminaConsumed({ userAddress, dayKey } = {}) {
+      const day = normalizeDayKey(dayKey);
+      const row = stmt.selectStaminaConsumed.get(normalizeAddress(userAddress), day);
+      return {
+        userAddress: normalizeAddress(userAddress),
+        dayKey: day,
+        consumed: row ? row.consumed : "0",
+      };
+    },
+
+    /**
+     * ADDS to the day's spent total — never replaces it. The read, the add and
+     * the upsert share one transaction, so two concurrent spends for the same
+     * (user, day) cannot both read the same total and one of them lose its
+     * delta; the `ON CONFLICT DO UPDATE` writes the WHOLE new total rather than
+     * a SQL `+=`, because `+=` on a TEXT column would be SQLite's floating-point
+     * addition and the whole reason this column is text is that it is not.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @param {number|string|bigint} params.amount Points spent by this claim.
+     * @returns {Promise<{ userAddress: string, dayKey: string, consumed: string }>}
+     */
+    async recordStaminaConsumption({ userAddress, dayKey, amount } = {}) {
+      const day = normalizeDayKey(dayKey);
+      const key = normalizeAddress(userAddress);
+      const spent = exactAmount(amount, "amount");
+      const total = db.transaction(() => {
+        const existing = stmt.selectStaminaConsumed.get(key, day);
+        const next = (existing ? BigInt(existing.consumed) : 0n) + spent;
+        stmt.upsertStaminaConsumption.run({
+          userAddress: key,
+          dayKey: day,
+          consumed: next.toString(),
+          updatedAt: Date.now(),
+        });
+        return next;
+      })();
+      return { userAddress: key, dayKey: day, consumed: total.toString() };
+    },
+
+    /**
+     * The user's current streak. `current: 0` with `lastGradedDay: null` means
+     * "never completed anything", which is a different state from a streak of 1
+     * and must stay distinguishable.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @returns {Promise<{ userAddress: string, current: number, lastGradedDay: string|null }>}
+     */
+    async getStreak({ userAddress } = {}) {
+      const key = normalizeAddress(userAddress);
+      const row = stmt.selectStreak.get(key);
+      return {
+        userAddress: key,
+        current: row ? Number(row.current_streak) : 0,
+        lastGradedDay: row && row.last_graded_day !== null ? row.last_graded_day : null,
+      };
+    },
+
+    /**
+     * Records one graded completion and advances the streak. The four cases —
+     * first ever → 1, same day again → unchanged, immediate next UTC day → +1,
+     * anything else (gap OR a retroactive earlier day) → reset to 1 — are
+     * specified, with their reasons, in `storage.js`. `isNextDayAfter` is the
+     * SHARED helper, so the memory adapter's rollover cannot differ from this
+     * one; and no cap is applied here, because capping is economic policy owned
+     * by another module and a cap applied at write time would be baked into rows
+     * already on disk.
+     *
+     * The daily active-miner row is written in the SAME transaction as the
+     * streak update, so a graded completion can never leave the streak advanced
+     * while the day fails to be counted.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day of the completion.
+     * @param {number|string|bigint} [params.reward] Audit fact only.
+     * @param {string} [params.missionId] Audit fact only.
+     * @returns {Promise<{ userAddress: string, current: number, lastGradedDay: string|null }>}
+     */
+    async recordGradedCompletion({ userAddress, dayKey, reward, missionId } = {}) {
+      const day = normalizeDayKey(dayKey);
+      const key = normalizeAddress(userAddress);
+      const rewardText = reward === undefined ? null : exactAmount(reward, "reward").toString();
+      const missionText = missionId === undefined || missionId === null ? null : String(missionId);
+      const current = db.transaction(() => {
+        const existing = stmt.selectStreak.get(key);
+        let next;
+        if (!existing) {
+          next = 1;
+        } else if (existing.last_graded_day === day) {
+          next = Number(existing.current_streak);
+        } else if (isNextDayAfter(existing.last_graded_day, day)) {
+          next = Number(existing.current_streak) + 1;
+        } else {
+          next = 1;
+        }
+        stmt.upsertStreak.run({
+          userAddress: key,
+          currentStreak: next,
+          lastGradedDay: day,
+          lastReward: rewardText,
+          lastMissionId: missionText,
+        });
+        // Idempotent: re-recording the same day must not create a second row,
+        // and the primary key is what enforces that rather than a JS check.
+        stmt.markActiveMiner.run(day, key);
+        return next;
+      })();
+      return { userAddress: key, current, lastGradedDay: day };
+    },
+
+    /**
+     * Free stamina GRANTED to one user on one UTC day, as a decimal string.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @returns {Promise<{ userAddress: string, dayKey: string, granted: string }>}
+     */
+    async getFreeStaminaGranted({ userAddress, dayKey } = {}) {
+      const day = normalizeDayKey(dayKey);
+      const row = stmt.selectFreeStaminaGranted.get(normalizeAddress(userAddress), day);
+      return { userAddress: normalizeAddress(userAddress), dayKey: day, granted: row ? row.granted : "0" };
+    },
+
+    /**
+     * Records a free-stamina grant against ONE day, accumulating within it. Day
+     * isolation is structural: the key is (user_address, day_key) and there is no
+     * code path that reads a grant without naming its day.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @param {number|string|bigint} params.amount Points granted.
+     * @returns {Promise<{ userAddress: string, dayKey: string, granted: string }>}
+     */
+    async recordFreeStaminaGrant({ userAddress, dayKey, amount } = {}) {
+      const day = normalizeDayKey(dayKey);
+      const key = normalizeAddress(userAddress);
+      const granted = exactAmount(amount, "amount");
+      const total = db.transaction(() => {
+        const existing = stmt.selectFreeStaminaGranted.get(key, day);
+        const next = (existing ? BigInt(existing.granted) : 0n) + granted;
+        stmt.upsertFreeStaminaGrant.run({
+          userAddress: key,
+          dayKey: day,
+          granted: next.toString(),
+          updatedAt: Date.now(),
+        });
+        return next;
+      })();
+      return { userAddress: key, dayKey: day, granted: total.toString() };
+    },
+
+    /**
+     * Reads one season by id, or `undefined` when there is no such season.
+     *
+     * @param {string} id Season id.
+     * @returns {Promise<Object|undefined>} `{ id, start, end, allocation, claimMode }`.
+     */
+    async getSeason(id) {
+      const row = stmt.selectSeason.get(String(id));
+      return row ? toSeason(row) : undefined;
+    },
+
+    /**
+     * Creates or replaces a season, keyed by `id`. `end: null` is the
+     * OPEN-ENDED season and is stored as SQL NULL, not as a sentinel.
+     *
+     * @param {Object} season See `storage.js`.
+     * @returns {Promise<Object>} The stored season.
+     */
+    async saveSeason({ id, start, end, allocation, claimMode } = {}) {
+      const startSeconds = Math.trunc(Number(start));
+      if (!Number.isFinite(startSeconds)) throw new TypeError("season.start must be unix seconds.");
+      const endSeconds = end === null || end === undefined ? null : Math.trunc(Number(end));
+      if (endSeconds !== null && !Number.isFinite(endSeconds)) {
+        throw new TypeError("season.end must be unix seconds or null.");
+      }
+      const row = {
+        id: String(id),
+        startAt: startSeconds,
+        endAt: endSeconds,
+        allocation: exactAmount(allocation, "allocation").toString(),
+        claimMode: claimMode === null || claimMode === undefined ? null : String(claimMode),
+      };
+      stmt.upsertSeason.run(row);
+      return toSeason(stmt.selectSeason.get(row.id));
+    },
+
+    /**
+     * The season covering an instant, or `undefined` when none does.
+     *
+     * `[start, end)`, start-INCLUSIVE and end-EXCLUSIVE, with overlap resolved to
+     * the LATEST `start` and ties broken by `id` ASC. Both properties are argued,
+     * and the index that serves the ORDER BY, in the migration comment above and
+     * in `storage.js`.
+     *
+     * @param {number} nowEpochSeconds The instant, unix seconds.
+     * @returns {Promise<Object|undefined>} The covering season, or `undefined`.
+     */
+    async getActiveSeason(nowEpochSeconds) {
+      const now = Math.trunc(Number(nowEpochSeconds));
+      if (!Number.isFinite(now)) throw new TypeError("getActiveSeason(nowEpochSeconds) requires a number.");
+      const row = stmt.selectActiveSeason.get(now, now);
+      return row ? toSeason(row) : undefined;
+    },
+
+    /**
+     * Records one season claim and returns the running totals.
+     *
+     * A duplicate `(seasonId, userAddress, nonce)` is refused BY THE SCHEMA — the
+     * composite primary key raises `UNIQUE constraint failed` — rather than by a
+     * check here, and the refusal is allowed to propagate. Turning it into a
+     * boolean would mean a caller that ignores the return value silently
+     * double-accrues, and the whole point of the nonce is that a retried request
+     * must not pay twice.
+     *
+     * Totals are summed in JavaScript as `BigInt` (not SQL `SUM`, which coerces
+     * TEXT to a double) and returned as canonical decimal strings.
+     *
+     * @param {Object} params See `storage.js`.
+     * @returns {Promise<{ seasonClaimedTotal: string, userAccrued: string }>}
+     */
+    async recordSeasonClaim({ seasonId, userAddress, amount, nonce } = {}) {
+      const season = String(seasonId);
+      const user = normalizeAddress(userAddress);
+      const nonceText = exactAmount(nonce, "nonce").toString();
+      const value = exactAmount(amount, "amount");
+      db.transaction(() => {
+        stmt.insertSeasonClaim.run({
+          seasonId: season,
+          userAddress: user,
+          nonce: nonceText,
+          amount: value.toString(),
+          claimedAt: Date.now(),
+        });
+      })();
+      return { seasonClaimedTotal: seasonTotal(season).toString(), userAccrued: userAccrued(season, user).toString() };
+    },
+
+    /**
+     * Everything claimed from a season so far, across all users.
+     *
+     * @param {string} seasonId Season id.
+     * @returns {Promise<string>} Canonical decimal string; `"0"` when nothing.
+     */
+    async getSeasonClaimedTotal(seasonId) {
+      return seasonTotal(String(seasonId)).toString();
+    },
+
+    /**
+     * Everything ONE user has accrued from a season.
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season id.
+     * @param {string} params.userAddress Wallet address.
+     * @returns {Promise<string>} Canonical decimal string; `"0"` when nothing.
+     */
+    async getSeasonUserAccrued({ seasonId, userAddress } = {}) {
+      return userAccrued(String(seasonId), normalizeAddress(userAddress)).toString();
+    },
+
+    /**
+     * Whether a `(season, user, nonce)` claim has already been recorded.
+     *
+     * @param {Object} params See `storage.js`.
+     * @returns {Promise<boolean>}
+     */
+    async isSeasonClaimUsed({ seasonId, userAddress, nonce } = {}) {
+      const key = exactAmount(nonce, "nonce").toString();
+      const row = stmt.selectSeasonClaim.get(String(seasonId), normalizeAddress(userAddress), key);
+      return row !== undefined;
+    },
+
+    /**
+     * How many DISTINCT users were active on a day, counted from the dedicated
+     * `daily_active_miners` ledger. `COUNT(*)` over a primary key whose leading
+     * column is `day_key`, so the distinctness is structural and the count is an
+     * index range scan — no table scan, and no clock read to derive a day from a
+     * timestamp. The specification, including why graded completions and not
+     * telemetry are the counted population, is in `storage.js`.
+     *
+     * @param {Object} params
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @returns {Promise<number>}
+     */
+    async countActiveMiners({ dayKey } = {}) {
+      return Number(stmt.countActiveMiners.get(normalizeDayKey(dayKey)).total);
     },
 
     /**

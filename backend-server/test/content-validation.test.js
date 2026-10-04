@@ -41,13 +41,20 @@ const {
   validateContent,
   validateMission,
   validateArticle,
+  MAX_STAMINA_COST_POINTS,
 } = require("../src/content.js");
 
-/** The three REAL seeded stamina costs, quoted verbatim from the seed. */
+/**
+ * The three REAL seeded stamina costs, quoted verbatim from the seed: 10, 20 and
+ * 30 UNITLESS STAMINA POINTS (see StakingManager.sol — stamina "is unitless and
+ * has no monetary value"), NOT 18-decimal CATT base units. They are plain JS
+ * integers because the reachable range is single-digit, so `Number.isSafeInteger`
+ * is lossless for them.
+ */
 const REAL_STAMINA_COSTS = [
-  ["mission-1", "1000000000000000000"],
-  ["mission-2", "2000000000000000000"],
-  ["mission-3", "3000000000000000000"],
+  ["mission-1", 10],
+  ["mission-2", 20],
+  ["mission-3", 30],
 ];
 
 /**
@@ -93,7 +100,8 @@ function validMission(overrides) {
     articleId: "art-focus-101",
     difficulty: DIFFICULTIES.EASY,
     reward: "5000000000000000000",
-    staminaCost: "2500000000000000000",
+    // Stamina is unitless POINTS, not a CATT amount: see StakingManager.sol.
+    staminaCost: 25,
     ...overrides,
   };
 }
@@ -127,6 +135,12 @@ test("all three real missions have a strictly positive staminaCost (the values q
   for (const [id, staminaCost] of REAL_STAMINA_COSTS) {
     assert.ok(BigInt(staminaCost) > 0n, `${id}: ${staminaCost} must be strictly positive`);
     assert.notEqual(staminaCost, "0");
+    assert.ok(Number.isSafeInteger(staminaCost), `${id}: ${staminaCost} must be a plain safe integer`);
+    assert.ok(
+      staminaCost <= MAX_STAMINA_COST_POINTS,
+      `${id}: ${staminaCost} points must be within the authoring ceiling — a value in the 1e18 ` +
+        "range is a CATT amount wearing a stamina label, and that mission could never settle"
+    );
     assert.doesNotThrow(() =>
       validateMission(
         missions.find((m) => m.id === id),
@@ -395,7 +409,8 @@ test("a whole VALID synthetic content set is ACCEPTED (guard is not vacuous)", (
     articleId: "art-focus-404",
     difficulty: DIFFICULTIES.MEDIUM,
     reward: "7000000000000000000",
-    staminaCost: "4000000000000000000",
+    // Stamina is unitless POINTS: 40, not 4 CATT.
+    staminaCost: 40,
   });
   const template = getArticle("art-focus-202");
   articles.push({ ...template, id: "art-focus-404", missionId: "mission-4" });
@@ -423,12 +438,12 @@ test("PROOF: require()-ing content.js with a zero-cost mission THROWS at module 
     '    articleId: "art-focus-101",',
     "    difficulty: DIFFICULTIES.EASY,",
     '    reward: "12000000000000000000", // 12 CATT',
-    '    staminaCost: "1000000000000000000", // 1 CATT',
+    '    staminaCost: 10, // 10 stamina POINTS (unitless), NOT 10 wei — see StakingManager.sol',
   ].join("\n");
   assert.ok(source.includes(missionBlock), "the seeded mission-1 block is where the poison goes");
   const poisoned = source.replace(
     missionBlock,
-    missionBlock.replace('staminaCost: "1000000000000000000"', 'staminaCost: "0"')
+    missionBlock.replace("staminaCost: 10,", 'staminaCost: "0",')
   );
   assert.notEqual(poisoned, source);
 
@@ -452,7 +467,7 @@ test("PROOF: require()-ing content.js with a zero-cost mission THROWS at module 
   // The real module is untouched and still loadable.
   const real = require("../src/content.js");
   assert.equal(real.listMissions().length, 3);
-  assert.equal(real.listMissions()[0].staminaCost, "1000000000000000000");
+  assert.equal(real.listMissions()[0].staminaCost, 10);
 });
 
 test("PROOF: mutating a deep CLONE of the seed to zero throws, and the real seed survives", () => {
@@ -465,7 +480,7 @@ test("PROOF: mutating a deep CLONE of the seed to zero throws, and the real seed
   assert.equal(err.field, "staminaCost");
 
   // The real frozen seed is exactly as it was, still servable.
-  assert.equal(MISSIONS[0].staminaCost, "1000000000000000000");
+  assert.equal(MISSIONS[0].staminaCost, 10);
   assert.deepEqual(
     listMissions().map((m) => [m.id, m.staminaCost]),
     REAL_STAMINA_COSTS
@@ -506,7 +521,7 @@ test("deep-freeze and defensive copies still hold after the guard was added", ()
   article.paragraphs[0] = "tampered";
   assert.notEqual(ARTICLES[0].paragraphs[0], "tampered");
 
-  assert.equal(getMissionLike("mission-1").staminaCost, "1000000000000000000");
+  assert.equal(getMissionLike("mission-1").staminaCost, 10);
 });
 
 test("getArticleLayout determinism PARITY: the layout is still the documented FNV-1a -> mulberry32 -> Fisher-Yates output", () => {
@@ -559,8 +574,11 @@ test("getArticleLayout determinism PARITY: the layout is still the documented FN
 test("getArticleLayout determinism PARITY: concrete golden fingerprint for one fixed session", () => {
   // The exact layout that content.test.js has always asserted for
   // (art-focus-101, session-abc): paragraphs in seed order [2, 0, 4, 3, 1] and
-  // a single trap at index 2 of type "hold-to-reveal". Byte-identical before
-  // and after the guard, because the guard consumes no PRNG draw.
+  // a single trap at index 2 of type "hold-to-reveal". The PRNG output is
+  // unchanged by the wave-9 stamina unit fix and by the guard, because neither
+  // consumes a draw — the ONLY thing that moved this fingerprint is
+  // `staminaCost`, which went from the 18-decimal string "1000000000000000000"
+  // to the unitless integer 10.
   const layout = getArticleLayout("art-focus-101", "session-abc");
   assert.deepEqual(
     layout.paragraphs.map((p) => ARTICLES[0].paragraphs.indexOf(p)),
@@ -568,11 +586,11 @@ test("getArticleLayout determinism PARITY: concrete golden fingerprint for one f
   );
   assert.equal(layout.focusTrap.index, 2);
   assert.equal(layout.focusTrap.type, "hold-to-reveal");
-  assert.equal(layout.staminaCost, "1000000000000000000");
+  assert.equal(layout.staminaCost, 10);
   assert.equal(layout.reward, "12000000000000000000");
   assert.equal(
     crypto.createHash("sha256").update(JSON.stringify(layout)).digest("hex"),
-    "a49e9f3425c06f914a3d967a3719b1ef457d9af95f8709ce6337c3a880fdd31d",
+    "5b54fb57a0669f96a7ebfc97a2e358d35580198c86e73aaf26aba8857c0fb69b",
     "the whole layout, byte for byte"
   );
   // Same session, 25 more calls: identical.

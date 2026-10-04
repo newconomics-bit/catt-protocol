@@ -35,7 +35,7 @@ const { ethers } = require("ethers");
 
 const content = require("../src/content");
 const { createApp, createStoreFromEnv } = require("../src/server");
-const { createSqliteStore } = require("../src/sqlite-store");
+const { createSqliteStore, SCHEMA_VERSION } = require("../src/sqlite-store");
 const { createMemoryStore } = require("../src/storage");
 
 /* -------------------------------------------------------------------------- */
@@ -299,7 +299,7 @@ test("restart (child process): a separate node process reads back every row", as
   const seen = JSON.parse(stdout);
 
   assert.notEqual(seen.pid, process.pid, "the read must come from a DIFFERENT process");
-  assert.equal(seen.schemaVersion, 1);
+  assert.equal(seen.schemaVersion, SCHEMA_VERSION, "the child reads the schema version this build creates");
   assert.deepEqual(seen.state, {
     sessions: 1,
     telemetry: 3,

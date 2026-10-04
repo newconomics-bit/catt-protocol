@@ -569,7 +569,9 @@ test("POST /api/submit PASSES and issues a signature the contract can verify off
   assert.equal(claim.user, USER_A);
   // The amounts are independently derivable from the mission the session opened.
   assert.equal(claim.reward, MISSION.reward);
-  assert.equal(claim.staminaCost, MISSION.staminaCost);
+  // The wire form of a unitless POINT count: `toUintString` renders the seed's
+  // plain integer `staminaCost` as the decimal text the EIP-712 struct carries.
+  assert.equal(claim.staminaCost, String(MISSION.staminaCost));
   assert.ok(BigInt(claim.reward) > 0n, "reward must be positive");
   assert.ok(BigInt(claim.staminaCost) > 0n, "staminaCost must be positive");
   assert.ok(Number(claim.nonce) >= 1);
@@ -587,7 +589,7 @@ test("POST /api/submit PASSES and issues a signature the contract can verify off
   const expectedClaim = {
     user: USER_A,
     reward: MISSION.reward,
-    staminaCost: MISSION.staminaCost,
+    staminaCost: String(MISSION.staminaCost),
     nonce: claim.nonce,
     deadline: claim.deadline,
   };
@@ -604,7 +606,9 @@ test("POST /api/submit PASSES and issues a signature the contract can verify off
 
   // The reward actually came from the anti-cheat verdict, not from the client.
   assert.equal(res.body.result.reward, MISSION.reward);
+  // The verdict carries the seed's own value: the unitless POINTS integer.
   assert.equal(res.body.result.staminaCost, MISSION.staminaCost);
+  assert.ok(Number.isSafeInteger(res.body.result.staminaCost));
 });
 
 test("a second PASS for the same user burns a strictly greater nonce", async () => {

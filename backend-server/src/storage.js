@@ -132,7 +132,40 @@
  *   --   code. The memory store below serialises the same check behind a
  *   --   synchronous read-modify-write, which is indivisible between awaits.
  *
- * No secret, key or credential is read, stored or logged by this module.
+ *   No secret, key or credential is read, stored or logged by this module.
+ *
+ * ===========================================================================
+ * THE GROWTH LEDGERS (the `getStaminaConsumed` … `countActiveMiners` block)
+ * ===========================================================================
+ * These are the durable state the growth mechanisms need, and they are pure
+ * MECHANICS: ledgers that count, and windows that resolve. NONE of them carries
+ * an economic decision — no reward, no season split, no multiplier, no
+ * free-stamina amount. The values that arrive here are recorded and totalled;
+ * what they are WORTH is decided elsewhere.
+ *
+ * ONE RULE GOVERNS ALL OF THEM: `dayKey` IS ALWAYS A CALLER-SUPPLIED
+ * `YYYY-MM-DD` STRING AND THE STORE NEVER READS A CLOCK.
+ *   Every method that is day-scoped takes the day from its caller. That is what
+ *   makes the store a pure function of its arguments: a test can drive a
+ *   ten-day streak, a month boundary and a leap day without waiting for any of
+ *   them, two Judge processes cannot disagree about which bucket an event lands
+ *   in, and a timezone change on the host cannot move a ledger. `content.js`'s
+ *   `dayKeyFor(now)` is where the clock is read — exactly once, at the edge,
+ *   by the caller — and everything downstream is deterministic.
+ *
+ * WHAT IS DELIBERATELY NOT HERE, and why it matters that it is not:
+ *   - No STAMINA BALANCE. Stamina is an on-chain balance (`StakingManager.stamina`);
+ *     this ledger counts what was SPENT per day, it does not hold the balance and
+ *     it cannot confiscate one. That is why the daily cap in `content.js` is a
+ *     throttle rather than a clawback.
+ *   - No STREAK CAP. `recordGradedCompletion` counts days; where a streak stops
+ *     paying out is economic policy owned by another module, and a cap applied
+ *     at WRITE time would be baked into rows already on disk — the policy would
+ *     become retroactively unreviewable and un-auditable. The cap belongs at
+ *     READ time, where it can change without rewriting history.
+ *
+ * POSTGRES DDL for these tables is documented beside the migration list in
+ * `./sqlite-store.js`, next to the SQLite version it mirrors.
  *
  * ===========================================================================
  * STORAGE ADAPTERS (`STORAGE_ADAPTERS` below)
@@ -183,9 +216,88 @@ const STORAGE_METHODS = Object.freeze([
   "recordIssuedClaim",
   "getIssuedClaim",
   "markRelayed",
+  // Growth ledgers: per-day stamina spend, streaks, free-stamina grants,
+  // seasons and their claims, and the daily active-miner count.
+  "getStaminaConsumed",
+  "recordStaminaConsumption",
+  "getStreak",
+  "recordGradedCompletion",
+  "getFreeStaminaGranted",
+  "recordFreeStaminaGrant",
+  "getSeason",
+  "saveSeason",
+  "getActiveSeason",
+  "recordSeasonClaim",
+  "getSeasonClaimedTotal",
+  "getSeasonUserAccrued",
+  "isSeasonClaimUsed",
+  "countActiveMiners",
   "close",
   "dispose",
 ]);
+
+/**
+ * Canonical form of a `dayKey`: a trimmed `YYYY-MM-DD` that names a REAL UTC
+ * calendar day.
+ *
+ * Shared by both adapters on purpose. The alternative — each adapter
+ * reimplementing "is this a day key" — is how two adapters end up accepting
+ * slightly different keys and silently writing to different buckets, which is
+ * precisely the divergence the parity test exists to prevent.
+ *
+ * The calendar check is real, not just a shape check: `2026-02-30` is a
+ * well-formed string that no UTC day ever names, and a ledger bucket keyed by it
+ * would be a bucket nothing can ever roll over into. It is refused here instead
+ * of being discovered as a streak that mysteriously never advances.
+ *
+ * @param {*} value Candidate day key.
+ * @returns {string} The canonical `YYYY-MM-DD`.
+ * @throws {TypeError} If `value` is not a real `YYYY-MM-DD` calendar day.
+ */
+function normalizeDayKey(value) {
+  if (typeof value !== "string") {
+    throw new TypeError("dayKey must be a caller-supplied YYYY-MM-DD string.");
+  }
+  const text = value.trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (!match) {
+    throw new TypeError(`dayKey must be a YYYY-MM-DD string, got ${JSON.stringify(value)}.`);
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const asUtc = new Date(Date.UTC(year, month - 1, day));
+  if (
+    asUtc.getUTCFullYear() !== year ||
+    asUtc.getUTCMonth() !== month - 1 ||
+    asUtc.getUTCDate() !== day
+  ) {
+    throw new TypeError(`dayKey ${JSON.stringify(value)} is not a real UTC calendar day.`);
+  }
+  return text;
+}
+
+/**
+ * True when `to` is the IMMEDIATE NEXT UTC calendar day after `from`.
+ *
+ * "Immediate next day" is computed through `Date.UTC` on the parsed parts, which
+ * is what makes month, year and leap boundaries fall out correctly instead of
+ * being a special case: `2024-02-28 -> 2024-02-29` is next, `2023-02-28 ->
+ * 2023-03-01` is next, `2024-12-31 -> 2025-01-01` is next, and `2024-03-01` is
+ * NOT the next day after `2024-02-28` (there is a leap day in between).
+ *
+ * `Date.UTC` is a pure function of its arguments — it is not a clock read, so
+ * using it here keeps the store's "never read a clock" promise intact.
+ *
+ * @param {string} from The earlier day key.
+ * @param {string} to The later day key.
+ * @returns {boolean}
+ */
+function isNextDayAfter(from, to) {
+  const start = Date.parse(`${normalizeDayKey(from)}T00:00:00.000Z`);
+  const end = Date.parse(`${normalizeDayKey(to)}T00:00:00.000Z`);
+  return Number.isFinite(start) && Number.isFinite(end) && end - start === 86400000;
+}
 
 /**
  * Throws if `store` does not implement every method named in
@@ -276,6 +388,18 @@ function createMemoryStore() {
   const nonceCounters = new Map();
   /** @type {Map<string, Object>} Issued claims keyed by `${userAddress}:${nonce}`. */
   const issuedClaims = new Map();
+  /** @type {Map<string, bigint>} Per-day stamina SPENT, keyed `${userAddress}|${dayKey}`. */
+  const staminaLedger = new Map();
+  /** @type {Map<string, Object>} One streak row per user, keyed by lowercase address. */
+  const streaks = new Map();
+  /** @type {Map<string, bigint>} Per-day free-stamina grants, keyed `${userAddress}|${dayKey}`. */
+  const freeGrants = new Map();
+  /** @type {Map<string, Object>} Season rows keyed by season id. */
+  const seasons = new Map();
+  /** @type {Map<string, bigint>} Season claims keyed `${seasonId}|${userAddress}|${nonce}`. */
+  const seasonClaims = new Map();
+  /** @type {Map<string, Set<string>>} Distinct users active per day, keyed by day key. */
+  const activeMiners = new Map();
   /** Monotonic submission id. Starts at 1 so id 0 is never a valid id. */
   let nextSubmissionId = 1;
   /** Monotonic insertion counter used to give telemetry a stable order. */
@@ -297,6 +421,96 @@ function createMemoryStore() {
    */
   function claimKey(userAddress, nonce) {
     return `${String(userAddress).toLowerCase()}:${Number(nonce)}`;
+  }
+
+  /**
+   * The key a per-day ledger row is stored under. Addresses are lowercased for
+   * the same reason `claimKey` does it: `0xAbC…` and `0xabc…` are one wallet,
+   * and two buckets per wallet would halve every cap that reads the ledger.
+   *
+   * @param {string} userAddress Wallet address.
+   * @param {string} dayKey Canonical `YYYY-MM-DD`.
+   * @returns {string}
+   */
+  function dayBucketKey(userAddress, dayKey) {
+    return `${String(userAddress).toLowerCase()}|${dayKey}`;
+  }
+
+  /**
+   * Coerces a ledger amount to an exact `bigint`.
+   *
+   * `bigint` is used rather than `Number` for the ACCUMULATOR even though real
+   * stamina amounts are single-digit points, because a ledger that silently
+   * rounds is a ledger that cannot be trusted: a runaway caller must produce an
+   * exact number or an error, never a plausible-looking total that is wrong.
+   *
+   * @param {*} value Candidate amount.
+   * @param {string} label Field name for the error message.
+   * @returns {bigint}
+   * @throws {TypeError} If `value` is not a non-negative integer amount.
+   */
+  function toExactAmount(value, label) {
+    if (value === null || value === undefined) {
+      throw new TypeError(`${label} is required and must be a non-negative integer amount.`);
+    }
+    if (typeof value === "bigint") {
+      if (value < 0n) throw new TypeError(`${label} must not be negative, got ${value}.`);
+      return value;
+    }
+    if (typeof value === "number") {
+      if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+        throw new TypeError(`${label} must be a non-negative integer amount, got ${String(value)}.`);
+      }
+      return BigInt(value);
+    }
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+      return BigInt(value.trim());
+    }
+    throw new TypeError(`${label} must be a non-negative integer amount, got ${JSON.stringify(value)}.`);
+  }
+
+  /**
+   * Marks one user active on one day, idempotently. Used by
+   * `recordGradedCompletion` to maintain the durable per-day active set that
+   * `countActiveMiners` reads.
+   *
+   * @param {string} userAddress Lowercased wallet address.
+   * @param {string} dayKey Canonical `YYYY-MM-DD`.
+   * @returns {void}
+   */
+  function markActive(userAddress, dayKey) {
+    const bucket = activeMiners.get(dayKey) || new Set();
+    bucket.add(userAddress);
+    activeMiners.set(dayKey, bucket);
+  }
+
+  /**
+   * The total claimed from a season across every user.
+   *
+   * @param {string} seasonId Season id.
+   * @returns {bigint}
+   */
+  function getSeasonTotal(seasonId) {
+    let total = 0n;
+    for (const [key, value] of seasonClaims.entries()) {
+      if (key.startsWith(`${seasonId}|`)) total += value;
+    }
+    return total;
+  }
+
+  /**
+   * Everything one user has accrued from a season.
+   *
+   * @param {string} seasonId Season id.
+   * @param {string} userAddress Lowercased wallet address.
+   * @returns {bigint}
+   */
+  function getUserAccrued(seasonId, userAddress) {
+    let total = 0n;
+    for (const [key, value] of seasonClaims.entries()) {
+      if (key.startsWith(`${seasonId}|${userAddress}|`)) total += value;
+    }
+    return total;
   }
 
   /**
@@ -773,6 +987,386 @@ function createMemoryStore() {
       return true;
     },
 
+    /* ------------------------------------------------------------------ *
+     * Growth ledgers. Pure mechanics, caller-supplied day keys, no clock  *
+     * and no economics — see the header note above.                        *
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Stamina SPENT by one user on one UTC day.
+     *
+     * This is a SPEND counter, not a balance. Stamina itself is an on-chain
+     * quantity (`StakingManager.stamina[account]`); this row exists so the daily
+     * cap in `content.js` can be re-derived per day instead of being applied to
+     * a lifetime total — which is exactly what makes unspent stamina roll over
+     * instead of being confiscated.
+     *
+     * The returned amount is a canonical DECIMAL STRING, not a number. Points
+     * are small in practice, but a counter that must be summed without loss
+     * above 2^53 has one honest representation and it is text; returning a
+     * number here would make exactness a property of how much a user spent.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @returns {Promise<{ userAddress: string, dayKey: string, consumed: string }>}
+     */
+    async getStaminaConsumed({ userAddress, dayKey } = {}) {
+      const key = dayBucketKey(userAddress, normalizeDayKey(dayKey));
+      const consumed = staminaLedger.get(key) || 0n;
+      return {
+        userAddress: String(userAddress).toLowerCase(),
+        dayKey: normalizeDayKey(dayKey),
+        consumed: consumed.toString(),
+      };
+    },
+
+    /**
+     * ADDS `amount` to the day's spent total. It accumulates and never replaces:
+     * three claims in one day must read back as the sum of all three, because the
+     * cap is about the total a user spends, not about the last thing they did.
+     *
+     * A second write for the same (user, day) never erases the first, and the
+     * day's row is keyed so that it CANNOT be duplicated — in the SQLite adapter
+     * that is a PRIMARY KEY, so the constraint is in the schema rather than in
+     * this line.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @param {number|string|bigint} params.amount Points spent by this claim.
+     * @returns {Promise<{ userAddress: string, dayKey: string, consumed: string }>}
+     *   The day's new total.
+     */
+    async recordStaminaConsumption({ userAddress, dayKey, amount } = {}) {
+      const day = normalizeDayKey(dayKey);
+      const key = dayBucketKey(userAddress, day);
+      const spent = toExactAmount(amount, "amount");
+      const total = (staminaLedger.get(key) || 0n) + spent;
+      staminaLedger.set(key, total);
+      return {
+        userAddress: String(userAddress).toLowerCase(),
+        dayKey: day,
+        consumed: total.toString(),
+      };
+    },
+
+    /**
+     * The user's current streak.
+     *
+     * `current` is 0 and `lastGradedDay` is `null` for a user who has never
+     * completed a graded mission: zero and "one day" are different states and a
+     * caller must be able to tell them apart.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @returns {Promise<{ userAddress: string, current: number, lastGradedDay: string|null }>}
+     */
+    async getStreak({ userAddress } = {}) {
+      const row = streaks.get(String(userAddress).toLowerCase());
+      return {
+        userAddress: String(userAddress).toLowerCase(),
+        current: row ? Number(row.current) : 0,
+        lastGradedDay: row && row.lastGradedDay ? row.lastGradedDay : null,
+      };
+    },
+
+    /**
+     * Records one GRADED completion (a mission the Judge passed) and advances the
+     * streak. The four cases, and why each is the only sane answer:
+     *
+     *   FIRST EVER         -> `1`. A streak of days is 1 long on the first day.
+     *   SAME DAY AGAIN     -> UNCHANGED. Two missions in one calendar day must
+     *                         not be two streak days; without this a user could
+     *                         double their streak in a single UTC day and the
+     *                         "consecutive days" claim would be false.
+     *   IMMEDIATE NEXT DAY -> `+1`. Real UTC rollover, computed from the parsed
+     *                         calendar parts, so month, year and leap boundaries
+     *                         are ordinary cases rather than special ones.
+     *   ANY OTHER DAY      -> reset to `1`. A gap breaks the chain. So does a
+     *                         RETROACTIVE earlier day (`isNextDayAfter` is
+     *                         direction-sensitive): back-filling an old day is
+     *                         not "yesterday", and honouring it would let a
+     *                         caller reconstruct a streak that never happened.
+     *
+     * NO CAP IS APPLIED HERE, DELIBERATELY. A cap on streak length is economic
+     * policy owned by another module, and applying it at WRITE time would bake
+     * the cap into rows that are already on disk — the policy would become
+     * unreviewable and impossible to change without rewriting history. The store
+     * counts; the policy decides what counting is worth.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day of the completion.
+     * @param {number|string|bigint} [params.reward] Reward for the completion.
+     *   Recorded as an audit fact only; nothing is derived from it here.
+     * @param {string} [params.missionId] Mission completed. Audit fact only.
+     * @returns {Promise<{ userAddress: string, current: number, lastGradedDay: string|null }>}
+     */
+    async recordGradedCompletion({ userAddress, dayKey, reward, missionId } = {}) {
+      const day = normalizeDayKey(dayKey);
+      const key = String(userAddress).toLowerCase();
+      const existing = streaks.get(key);
+      let current;
+      if (!existing) {
+        current = 1;
+      } else if (existing.lastGradedDay === day) {
+        current = Number(existing.current);
+      } else if (isNextDayAfter(existing.lastGradedDay, day)) {
+        current = Number(existing.current) + 1;
+      } else {
+        current = 1;
+      }
+      streaks.set(key, {
+        current,
+        lastGradedDay: day,
+        // Audit facts. Deliberately NOT part of the streak view: the view is the
+        // mechanics, and the audit trail is the store's business.
+        lastReward: reward === undefined ? null : toExactAmount(reward, "reward").toString(),
+        lastMissionId: missionId === undefined || missionId === null ? null : String(missionId),
+      });
+      // The daily active set is a LEDGER, not a projection of the streak row:
+      // yesterday must still count yesterday's users after today's completion has
+      // moved `lastGradedDay` forward.
+      markActive(key, day);
+      return { userAddress: key, current, lastGradedDay: day };
+    },
+
+    /**
+     * Free stamina GRANTED to one user on one UTC day, as a decimal string.
+     * Zero when nothing was granted.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @returns {Promise<{ userAddress: string, dayKey: string, granted: string }>}
+     */
+    async getFreeStaminaGranted({ userAddress, dayKey } = {}) {
+      const day = normalizeDayKey(dayKey);
+      const granted = freeGrants.get(dayBucketKey(userAddress, day)) || 0n;
+      return { userAddress: String(userAddress).toLowerCase(), dayKey: day, granted: granted.toString() };
+    },
+
+    /**
+     * Records a free-stamina grant against ONE day, accumulating within it.
+     *
+     * DAY ISOLATION IS THE WHOLE POINT. A grant made on day A must be invisible
+     * on day B: the key is (user, day), never user alone, so there is no code
+     * path by which "yesterday's free stamina" can be read as "today's". This is
+     * also what lets a future daily-grant mechanism be replayed or audited a day
+     * at a time without a ledger that has to be rewound.
+     *
+     * @param {Object} params
+     * @param {string} params.userAddress Wallet address.
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @param {number|string|bigint} params.amount Points granted.
+     * @returns {Promise<{ userAddress: string, dayKey: string, granted: string }>}
+     *   That day's new total.
+     */
+    async recordFreeStaminaGrant({ userAddress, dayKey, amount } = {}) {
+      const day = normalizeDayKey(dayKey);
+      const key = dayBucketKey(userAddress, day);
+      const granted = toExactAmount(amount, "amount");
+      const total = (freeGrants.get(key) || 0n) + granted;
+      freeGrants.set(key, total);
+      return { userAddress: String(userAddress).toLowerCase(), dayKey: day, granted: total.toString() };
+    },
+
+    /**
+     * Reads one season by id, or `undefined` when there is no such season.
+     *
+     * @param {string} id Season id.
+     * @returns {Promise<Object|undefined>} `{ id, start, end, allocation, claimMode }`.
+     */
+    async getSeason(id) {
+      const season = seasons.get(String(id));
+      return season ? clone(season) : undefined;
+    },
+
+    /**
+     * Creates or REPLACES a season, keyed by `id`.
+     *
+     * Upsert, not insert-or-fail: an operator correcting a window or a claim mode
+     * must not be blocked by the row already existing, and the id is the identity
+     * so a repeat call with the same id is the same season by definition.
+     *
+     * `end: null` means OPEN-ENDED: the season has no closing instant, which is a
+     * real state and not "missing" — so it is represented by `null` on both sides
+     * rather than by a sentinel like `0` that `getActiveSeason` would have to
+     * special-case.
+     *
+     * @param {Object} season
+     * @param {string} season.id Season id.
+     * @param {number} season.start Window start, unix SECONDS.
+     * @param {number|null} [season.end] Window end, unix seconds, exclusive; `null`
+     *   for an open-ended season.
+     * @param {number|string|bigint} season.allocation Season allocation, an
+     *   18-decimal CATT amount (stored and returned as an exact decimal string).
+     * @param {string} season.claimMode Claim mode for the season.
+     * @returns {Promise<Object>} The stored season.
+     */
+    async saveSeason({ id, start, end, allocation, claimMode } = {}) {
+      const startSeconds = Math.trunc(Number(start));
+      if (!Number.isFinite(startSeconds)) throw new TypeError("season.start must be unix seconds.");
+      const endSeconds = end === null || end === undefined ? null : Math.trunc(Number(end));
+      if (endSeconds !== null && !Number.isFinite(endSeconds)) {
+        throw new TypeError("season.end must be unix seconds or null.");
+      }
+      const season = {
+        id: String(id),
+        start: startSeconds,
+        end: endSeconds,
+        allocation: toExactAmount(allocation, "allocation").toString(),
+        claimMode: claimMode === null || claimMode === undefined ? null : String(claimMode),
+      };
+      seasons.set(season.id, season);
+      return clone(season);
+    },
+
+    /**
+     * The season covering an instant, or `undefined` when none does.
+     *
+     * THE WINDOW IS START-INCLUSIVE AND END-EXCLUSIVE: `[start, end)`. That is
+     * not a preference, it is what makes BACK-TO-BACK SEASONS well defined. If
+     * both windows were inclusive, season N's closing second would also be
+     * season N+1's opening second and a claim landing there would have two
+     * owners. With `[start, end)` the instants partition cleanly, and an open
+     * ended season (`end === null`) is the one that owns everything from its
+     * start onward.
+     *
+     * OVERLAP IS RESOLVED DETERMINISTICALLY: the candidate with the LATEST `start`
+     * wins, ties broken by `id` ascending. Overlapping windows are an operator
+     * mistake, not a design, and the alternative — returning whichever row the
+     * planner happened to emit first — would make an allocation depend on
+     * insertion order, which is exactly the kind of invisible difference between
+     * two Judge processes that the rest of this file goes to such lengths to
+     * prevent. "The most recently started season owns the instant" is also the
+     * answer that matches the intuition of an operator who opened a new season
+     * and forgot to close the old one.
+     *
+     * @param {number} nowEpochSeconds The instant, unix seconds.
+     * @returns {Promise<Object|undefined>} The covering season, or `undefined`.
+     */
+    async getActiveSeason(nowEpochSeconds) {
+      const now = Math.trunc(Number(nowEpochSeconds));
+      if (!Number.isFinite(now)) throw new TypeError("getActiveSeason(nowEpochSeconds) requires a number.");
+      const covering = [...seasons.values()]
+        .filter((season) => season.start <= now && (season.end === null || now < season.end))
+        .sort((left, right) => (right.start - left.start) || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+      return covering.length > 0 ? clone(covering[0]) : undefined;
+    },
+
+    /**
+     * Records one season claim and returns the running totals.
+     *
+     * `nonce` is part of the IDENTITY, not decoration: the same user may claim in
+     * the same season many times, so `(seasonId, userAddress)` alone would collide
+     * and refuse the second claim. `(seasonId, userAddress, nonce)` is what makes
+     * a claim idempotent — a retried request with the same nonce is refused as a
+     * duplicate rather than accruing a second time — while still letting one user
+     * accrue across many nonces.
+     *
+     * The totals are exact decimal strings, because a season allocation is
+     * 18-decimal CATT and a running total that rounds is a total that can exceed
+     * the allocation it is supposed to be bounded by.
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season claimed.
+     * @param {string} params.userAddress Claiming wallet.
+     * @param {number|string|bigint} params.amount Amount claimed.
+     * @param {number|string|bigint} params.nonce Caller's idempotency nonce.
+     * @returns {Promise<{ seasonClaimedTotal: string, userAccrued: string }>}
+     */
+    async recordSeasonClaim({ seasonId, userAddress, amount, nonce } = {}) {
+      const season = String(seasonId);
+      const user = String(userAddress).toLowerCase();
+      const nonceText = toExactAmount(nonce, "nonce").toString();
+      const key = `${season}|${user}|${nonceText}`;
+      if (seasonClaims.has(key)) {
+        throw new Error(`store: season claim already recorded for ${season}/${user}/${nonceText}.`);
+      }
+      const value = toExactAmount(amount, "amount");
+      seasonClaims.set(key, value);
+      return {
+        seasonClaimedTotal: getSeasonTotal(season).toString(),
+        userAccrued: getUserAccrued(season, user).toString(),
+      };
+    },
+
+    /**
+     * Everything claimed from a season so far, across all users, as a decimal
+     * string. `"0"` when nothing has been claimed.
+     *
+     * @param {string} seasonId Season id.
+     * @returns {Promise<string>}
+     */
+    async getSeasonClaimedTotal(seasonId) {
+      return getSeasonTotal(String(seasonId)).toString();
+    },
+
+    /**
+     * Everything ONE user has accrued from a season, as a decimal string.
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season id.
+     * @param {string} params.userAddress Wallet address.
+     * @returns {Promise<string>}
+     */
+    async getSeasonUserAccrued({ seasonId, userAddress } = {}) {
+      return getUserAccrued(String(seasonId), String(userAddress).toLowerCase()).toString();
+    },
+
+    /**
+     * Whether a `(season, user, nonce)` claim has already been recorded.
+     *
+     * This is the check an idempotent caller makes BEFORE claiming: the store's
+     * own rejection is the backstop, but a caller that can ask first does not
+     * have to turn a duplicate into an error at all.
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season id.
+     * @param {string} params.userAddress Wallet address.
+     * @param {number|string|bigint} params.nonce Claim nonce.
+     * @returns {Promise<boolean>}
+     */
+    async isSeasonClaimUsed({ seasonId, userAddress, nonce } = {}) {
+      const key = `${String(seasonId)}|${String(userAddress).toLowerCase()}|${toExactAmount(nonce, "nonce").toString()}`;
+      return seasonClaims.has(key);
+    },
+
+    /**
+     * How many DISTINCT users were active (i.e. completed a graded mission) on a
+     * day. `0` for a day nobody was active.
+     *
+     * READ FROM A DEDICATED LEDGER (`daily_active_miners`), NOT DERIVED FROM THE
+     * STREAK ROW. That distinction is load-bearing: a streak row holds only the
+     * user's LATEST graded day, so a projection would silently shrink yesterday's
+     * count the moment the same user completed something today — and yesterday's
+     * number is exactly the number an operator is looking at. The ledger has one
+     * row per (day, user), written by `recordGradedCompletion`.
+     *
+     * GRADED COMPLETIONS ONLY, and that is a deliberate boundary rather than a
+     * simplification: the `telemetry` table has NO `day_key` column and its link to
+     * a user runs through `sessions.session_id`, whose `user_address` may be NULL
+     * (it is deliberately not back-filled — `createSession` refuses to attribute a
+     * session to a wallet it was not registered with). Counting telemetry would
+     * therefore require the store to derive a day from a timestamp, which is
+     * exactly the clock read this interface forbids. It would also count a user
+     * who opened an article and left as "active", which is not what "active" means
+     * for a mining metric.
+     *
+     * Distinctness matters as much as the day: one enthusiastic user completing
+     * four missions is ONE active user.
+     *
+     * @param {Object} params
+     * @param {string} params.dayKey `YYYY-MM-DD` UTC day.
+     * @returns {Promise<number>}
+     */
+    async countActiveMiners({ dayKey } = {}) {
+      const bucket = activeMiners.get(normalizeDayKey(dayKey));
+      return bucket ? bucket.size : 0;
+    },
+
     /**
      * Releases every resource the store holds. A no-op here because there is
      * nothing to release in-process, but it exists so the caller code (server
@@ -875,4 +1469,9 @@ module.exports = {
   assertStoreShape,
   createMemoryStore,
   getStorageAdapter,
+  // Shared day-key helpers, used by BOTH adapters so the two cannot drift on
+  // what a valid day key is or what "the next day" means. Not part of the store
+  // contract — they are pure functions.
+  normalizeDayKey,
+  isNextDayAfter,
 };
