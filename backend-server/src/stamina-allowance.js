@@ -1,7 +1,8 @@
 /**
  * CATT Protocol — the DAILY FREE-STAMINA ALLOWANCE.
  *
- * WHAT IT IS: a user is granted 30 stamina POINTS per UTC day, once per day,
+ * WHAT IT IS: a user is granted 30 stamina POINTS per WIB BUSINESS DAY (the
+ * 04:00 WIB / 21:00-UTC rollover owned by `reset-schedule.js`), once per day,
  * tracked in an off-chain per-day ledger. That is the entire mechanism. There is
  * no token minted, no balance held, no claim signed, no chain touched.
  *
@@ -45,7 +46,7 @@
  * ===========================================================================
  * HOW IT INTERACTS WITH `DEFAULT_DAILY_STAMINA_CAP = 50`
  * ===========================================================================
- * The 50 is a cap on stamina SPENT per UTC day, and the 30 is a grant of stamina
+ * The 50 is a cap on stamina SPENT per business day, and the 30 is a grant of stamina
  * AVAILABLE. They are different quantities and they compose as:
  *
  *     daily staked stamina (say 50 from one stake) + 30 free
@@ -124,7 +125,7 @@ const { DEFAULT_DAILY_STAMINA_CAP, dayKeyFor } = require("./content");
 /* -------------------------------------------------------------------------- */
 
 /**
- * Free stamina granted per UTC day, in POINTS.
+ * Free stamina granted per WIB BUSINESS DAY, in POINTS.
  *
  * `30`, the integer. See the module header for the reported discrepancy: at the
  * shipped costs of 10 / 20 / 30 points this funds three easy missions, one hard

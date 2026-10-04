@@ -310,15 +310,26 @@ test("cap: the policy admits up to the cap, refuses past it, and `cap: null` dis
   }
 });
 
-test("dayKey: dayKeyFor is UTC, timezone-immune, and reads no clock itself", () => {
+test("dayKey: dayKeyFor is the WIB BUSINESS day (04:00 WIB = 21:00 UTC), timezone-immune, and reads no clock itself", () => {
+  // !! BEHAVIOUR CHANGE: the day used to roll at 00:00 UTC. It now rolls at
+  // 04:00 WIB, which is 21:00 UTC of the PREVIOUS UTC date, because WIB is a
+  // fixed UTC+7 with no DST. So an instant between 21:00:00Z and 23:59:59Z
+  // names TOMORROW's date. See `src/reset-schedule.js` and
+  // `test/reset-schedule.test.js` for the full rule; the cases below are the
+  // instants whose expected keys moved.
+  //
+  // Inside a business day (before 21:00Z) the key is the UTC date, unchanged.
   assert.equal(content.dayKeyFor(Date.UTC(2026, 0, 1, 0, 0, 0)), "2026-01-01");
-  // 23:59:59.999 UTC is still that day, whatever the host timezone is.
-  assert.equal(content.dayKeyFor(new Date("2026-01-01T23:59:59.999Z")), "2026-01-01");
-  // A month boundary, a year boundary and a leap day.
-  assert.equal(content.dayKeyFor(new Date("2026-01-31T23:59:59.999Z")), "2026-01-31");
+  assert.equal(content.dayKeyFor(new Date("2026-01-01T12:00:00.000Z")), "2026-01-01");
   assert.equal(content.dayKeyFor(new Date("2026-02-01T00:00:00.000Z")), "2026-02-01");
   assert.equal(content.dayKeyFor(new Date("2024-02-29T12:00:00.000Z")), "2024-02-29");
-  assert.equal(content.dayKeyFor(new Date("2025-12-31T23:59:59.999Z")), "2025-12-31");
+  // 23:59:59.999 UTC is 03:00 WIB the NEXT morning: still the day it names.
+  assert.equal(content.dayKeyFor(new Date("2026-01-01T23:59:59.999Z")), "2026-01-02");
+  // A month boundary, a year boundary and the leap day, at the 21:00 rollover.
+  assert.equal(content.dayKeyFor(new Date("2026-01-31T20:59:59.999Z")), "2026-01-31");
+  assert.equal(content.dayKeyFor(new Date("2026-01-31T21:00:00.000Z")), "2026-02-01");
+  assert.equal(content.dayKeyFor(new Date("2025-12-31T20:59:59.999Z")), "2025-12-31");
+  assert.equal(content.dayKeyFor(new Date("2025-12-31T21:00:00.000Z")), "2026-01-01");
   assert.equal(content.dayKeyFor(new Date("2026-01-01T00:00:00.000Z")), "2026-01-01");
   // The clock is injected, never defaulted: calling it with no argument is an
   // error, because `new Date()` inside a pure module is a clock read.

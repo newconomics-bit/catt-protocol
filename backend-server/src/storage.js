@@ -153,6 +153,18 @@
  *   `dayKeyFor(now)` is where the clock is read — exactly once, at the edge,
  *   by the caller — and everything downstream is deterministic.
  *
+ *   WHAT THAT DAY KEY IS: since the 04:00 WIB rule (`reset-schedule.js`) it is
+ *   the PLAYER-FACING WIB BUSINESS DAY, which rolls at 21:00 UTC of the
+ *   previous UTC date rather than at 00:00 UTC. The store does not need to know
+ *   that, and this is the reason it does not have to: `isNextDayAfter` compares
+ *   two day-KEY STRINGS as calendar dates, and business days are still calendar
+ *   dates one-to-one — 24-hour buckets in a fixed-offset zone with no DST. The
+ *   rollover was decided once, upstream, where the clock is read. So the streak
+ *   arithmetic below is UNCHANGED and remains correct under the new rule: it
+ *   never re-derives a day from an instant, and there is no UTC assumption left
+ *   in it to break. The words "UTC" below that describe a calendar date are
+ *   historical wording, not a rule this file enforces.
+ *
  * WHAT IS DELIBERATELY NOT HERE, and why it matters that it is not:
  *   - No STAMINA BALANCE. Stamina is an on-chain balance (`StakingManager.stamina`);
  *     this ledger counts what was SPENT per day, it does not hold the balance and
@@ -237,8 +249,11 @@ const STORAGE_METHODS = Object.freeze([
 ]);
 
 /**
- * Canonical form of a `dayKey`: a trimmed `YYYY-MM-DD` that names a REAL UTC
- * calendar day.
+ * Canonical form of a `dayKey`: a trimmed `YYYY-MM-DD` that names a REAL
+ * calendar day. The day is a WIB BUSINESS day (it rolls at 04:00 WIB / 21:00
+ * UTC — see `reset-schedule.js`), but the check below is frame-independent: a
+ * business day is still a calendar date, so this validates the same strings it
+ * always did.
  *
  * Shared by both adapters on purpose. The alternative — each adapter
  * reimplementing "is this a day key" — is how two adapters end up accepting
@@ -246,7 +261,7 @@ const STORAGE_METHODS = Object.freeze([
  * precisely the divergence the parity test exists to prevent.
  *
  * The calendar check is real, not just a shape check: `2026-02-30` is a
- * well-formed string that no UTC day ever names, and a ledger bucket keyed by it
+ * well-formed string that no day ever names, and a ledger bucket keyed by it
  * would be a bucket nothing can ever roll over into. It is refused here instead
  * of being discovered as a streak that mysteriously never advances.
  *
@@ -272,13 +287,13 @@ function normalizeDayKey(value) {
     asUtc.getUTCMonth() !== month - 1 ||
     asUtc.getUTCDate() !== day
   ) {
-    throw new TypeError(`dayKey ${JSON.stringify(value)} is not a real UTC calendar day.`);
+    throw new TypeError(`dayKey ${JSON.stringify(value)} is not a real calendar day.`);
   }
   return text;
 }
 
 /**
- * True when `to` is the IMMEDIATE NEXT UTC calendar day after `from`.
+ * True when `to` is the IMMEDIATE NEXT business day after `from`.
  *
  * "Immediate next day" is computed through `Date.UTC` on the parsed parts, which
  * is what makes month, year and leap boundaries fall out correctly instead of
@@ -288,6 +303,17 @@ function normalizeDayKey(value) {
  *
  * `Date.UTC` is a pure function of its arguments — it is not a clock read, so
  * using it here keeps the store's "never read a clock" promise intact.
+ *
+ * WIB NOTE (REPORTED, NOT REWRITTEN): this is pure calendar arithmetic on two
+ * day-KEY STRINGS, and that is exactly why it needs no change for the 04:00 WIB
+ * rule. The 21:00-UTC rollover is applied once, upstream, when the caller turns
+ * an instant into a day key (`content.js#dayKeyFor` -> `reset-schedule.js`);
+ * once a key is in hand, "the next day" is a property of the calendar, not of a
+ * timezone. Consecutive WIB keys differ by exactly 86400 s because WIB is a
+ * fixed UTC+7 with no DST, so the 24-hour test below remains the right test. The
+ * alternative — routing this through an instant-aware helper — would add a
+ * timezone dependency to a layer whose whole design principle is that it has
+ * none, and would change nothing observable.
  *
  * @param {string} from The earlier day key.
  * @param {string} to The later day key.
@@ -1080,9 +1106,13 @@ function createMemoryStore() {
      *                         not be two streak days; without this a user could
      *                         double their streak in a single UTC day and the
      *                         "consecutive days" claim would be false.
-     *   IMMEDIATE NEXT DAY -> `+1`. Real UTC rollover, computed from the parsed
-     *                         calendar parts, so month, year and leap boundaries
-     *                         are ordinary cases rather than special ones.
+     *   IMMEDIATE NEXT DAY -> `+1`. A real rollover of the caller's day key,
+     *                         computed from the parsed calendar parts, so month,
+     *                         year and leap boundaries are ordinary cases rather
+     *                         than special ones. The day key is already the WIB
+     *                         business day (04:00 WIB rollover), so consecutive
+     *                         keys are consecutive business days — see
+     *                         `isNextDayAfter`.
      *   ANY OTHER DAY      -> reset to `1`. A gap breaks the chain. So does a
      *                         RETROACTIVE earlier day (`isNextDayAfter` is
      *                         direction-sensitive): back-filling an old day is

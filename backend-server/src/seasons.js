@@ -1099,8 +1099,29 @@ module.exports = {
   toExactCatt,
   /**
    * Re-exported from `content.js` so a caller holding only this module can name
-   * the day a settled claim belongs to without a second import. Still UTC
-   * `YYYY-MM-DD`, still caller-supplied `now`, never read from a clock here.
+   * the day a settled claim belongs to without a second import. Still a
+   * `YYYY-MM-DD` business day, still caller-supplied `now`, never read from a
+   * clock here.
+   *
+   * !! IT IS NOW A WIB BUSINESS DAY, NOT A UTC ONE !! Since the 04:00 WIB rule
+   * it rolls at 21:00 UTC of the previous UTC date (`reset-schedule.js`), so
+   * between 21:00Z and 23:59:59Z it names tomorrow's UTC date.
+   *
+   * AND THE SEASON BOUNDARIES ALREADY SATISFY THAT RULE, which is the point of
+   * noting it here. A season window is an ABSOLUTE INSTANT pair `[start, end)`,
+   * not a calendar expression, so there is no timezone left in it to get wrong:
+   * whatever instant was chosen as the boundary, that instant is the boundary,
+   * on every machine, in any process timezone. A founder who asks for "the
+   * calendar-month boundary at 04:00 WIB on the 1st" is asking for a specific
+   * INSTANT, and under the WIB rule that instant is 21:00 UTC on the LAST day
+   * of the previous month — e.g. `2026-03-01T00:00:00Z` minus 3 hours =
+   * `2026-02-28T21:00:00Z` is the start of the March season. Write that as the
+   * literal 21:00 UTC on the previous month's last day (or compute it with
+   * `resetEpochFor`), and do NOT express it as "midnight UTC on the 1st", which
+   * would put the rollover three hours early and hand the last three hours of
+   * every month to the season that is ending. The shipped schedule below does
+   * neither — it is `epoch + index * 30 days` — and
+   * `test/reset-schedule.test.js` asserts the month-boundary equivalence.
    */
   dayKeyFor,
   normalizeDayKey,

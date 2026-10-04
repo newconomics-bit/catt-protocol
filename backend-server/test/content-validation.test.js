@@ -451,6 +451,11 @@ test("PROOF: require()-ing content.js with a zero-cost mission THROWS at module 
   const tmpFile = path.join(tmpDir, "poisoned-content.js");
   try {
     fs.writeFileSync(tmpFile, poisoned, "utf8");
+    // `content.js` now delegates its day key to `./reset-schedule` (the 04:00 WIB
+    // rule), so the copy must travel WITH that module or `require` would fail
+    // with a MODULE_NOT_FOUND — the wrong error entirely, and one this test
+    // would misread as a broken validator.
+    fs.copyFileSync(path.join(__dirname, "..", "src", "reset-schedule.js"), path.join(tmpDir, "reset-schedule.js"));
     const err = expectRejection(() => require(tmpFile));
     assert.equal(err.code, CONTENT_ERRORS.INVALID_MISSION);
     assert.equal(err.missionId, "mission-1", "the poisoned mission is named");

@@ -60,9 +60,13 @@ const MIXED_CASE = "0xaBcDeF0123456789aBcDeF0123456789AbCdEf01";
 /** Well beyond 2^53 (9007199254740992), so a lossy counter would be visible. */
 const HUGE = "9007199254740993";
 
-const DAY_1 = Date.UTC(2026, 0, 2, 9, 30, 0); // 2026-01-02
-const DAY_1_LATER = Date.UTC(2026, 0, 2, 23, 59, 59);
-const DAY_2 = Date.UTC(2026, 0, 3, 0, 0, 1);
+const DAY_1 = Date.UTC(2026, 0, 2, 9, 30, 0); // 2026-01-02, 16:30 WIB
+// STILL THE SAME BUSINESS DAY. The day rolls at 04:00 WIB = 21:00 UTC, so the
+// latest instant of business day 2026-01-02 is 20:59:59 UTC (03:59:59 WIB on
+// the 3rd). The old 23:59:59 fixture would now be the NEXT business day, which
+// is a different ledger bucket — which is the whole point of the rule.
+const DAY_1_LATER = Date.UTC(2026, 0, 2, 20, 59, 59);
+const DAY_2 = Date.UTC(2026, 0, 3, 0, 0, 1); // the next business day: 2026-01-03
 const DAY_10 = Date.UTC(2026, 0, 11, 12, 0, 0);
 const LEAP_DAY = Date.UTC(2028, 1, 29, 6, 0, 0);
 const DAY_AFTER_LEAP_DAY = Date.UTC(2028, 2, 1, 6, 0, 0);

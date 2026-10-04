@@ -78,6 +78,13 @@
  * Pure module: no I/O, no clock, no randomness, no environment access.
  */
 
+/**
+ * The one canonical definition of a business day. `dayKeyFor` below delegates
+ * to it rather than computing a date of its own, which is what guarantees there
+ * is exactly ONE rollover rule in the backend.
+ */
+const { wibDayKey } = require("./reset-schedule");
+
 const DIFFICULTIES = Object.freeze({
   EASY: "EASY",
   MEDIUM: "MEDIUM",
@@ -894,14 +901,33 @@ function validateContent(content) {
 const DEFAULT_DAILY_STAMINA_CAP = 50;
 
 /**
- * The UTC calendar day an instant belongs to, as `YYYY-MM-DD`.
+ * The PLAYER-FACING BUSINESS DAY an instant belongs to, as `YYYY-MM-DD`.
  *
- * WHY UTC AND NOT LOCAL TIME: the day key is a storage key. If it were computed
- * from the host's local timezone then the same instant would land in two
- * different buckets depending on which machine ran the Judge, the ledger would
- * fork across a redeploy, and a user could spend their cap twice by moving
- * between two timezones. `toISOString()` is UTC by definition, so `slice(0, 10)`
- * is the calendar day in one fixed frame for every process on earth.
+ * !! BEHAVIOUR CHANGE (the "Genshin rule", 04:00 WIB) !!
+ * This used to be the UTC calendar day, rolling at 00:00 UTC. It is now the WIB
+ * business day, which rolls at 04:00 WIB = 21:00 UTC of the PREVIOUS UTC date.
+ * Between 21:00:00 UTC and 23:59:59 UTC the key therefore names TOMORROW's UTC
+ * date. Every caller still gets a `YYYY-MM-DD` string and still gets it from one
+ * definition — the shape of the API is unchanged, only the boundary moved — but
+ * any test, ledger reading or assertion that assumed a 00:00 UTC rollover must
+ * be re-read against the new rule. This is the founder's product decision, not
+ * an optimisation: a user playing at 23:55 WIB is still on the same business day
+ * they started on, so their streak and their stamina do not evaporate overnight.
+ *
+ * THE RULE, delegated, not reimplemented: the arithmetic lives in
+ * `reset-schedule.js#wibDayKey`, which is the single canonical definition of a
+ * business day for the whole backend. This function exists only to keep the
+ * `Date`/milliseconds calling convention that `server.js`, `stamina-allowance.js`
+ * and `seasons.js` already use, and to convert the unit at that one boundary
+ * (milliseconds here, epoch seconds in `reset-schedule.js`).
+ *
+ * WHY UTC-ANCHORED AND NOT HOST-LOCAL TIME: the day key is a storage key. If it
+ * were computed from the host's local timezone then the same instant would land
+ * in two different buckets depending on which machine ran the Judge, the ledger
+ * would fork across a redeploy, and a user could spend their cap twice by moving
+ * between two timezones. The WIB rule is applied as a FIXED UTC+7 offset (see
+ * `reset-schedule.js`'s header for why that is exact for this audience), never
+ * as a `Date`-local computation.
  *
  * WHY THE CALLER SUPPLIES `now`: this module reads no clock. It is a pure module
  * — no I/O, no clock, no randomness, no environment — and an argument is the
@@ -909,7 +935,7 @@ const DEFAULT_DAILY_STAMINA_CAP = 50;
  * would put `Date.now()` back into a file whose header promises it is not there.
  *
  * @param {Date|number} now The instant, as a `Date` or epoch milliseconds.
- * @returns {string} `YYYY-MM-DD` in UTC.
+ * @returns {string} `YYYY-MM-DD`, the WIB business day.
  * @throws {TypeError} If `now` is not a `Date` or a finite epoch-milliseconds
  *   number.
  */
@@ -921,13 +947,17 @@ function dayKeyFor(now) {
     );
   }
   const instant = now instanceof Date ? now : new Date(Number(now));
-  if (!Number.isFinite(instant.getTime())) {
+  const time = instant.getTime();
+  if (!Number.isFinite(time)) {
     throw new TypeError(
       "dayKeyFor(now): `now` must be a Date or epoch milliseconds — the clock is injected, " +
         "never read from inside this module."
     );
   }
-  return instant.toISOString().slice(0, 10);
+  // MILLISECONDS IN, EPOCH SECONDS OUT. The conversion is here, at the one
+  // boundary that speaks milliseconds, so `wibDayKey` can be strict about its
+  // unit instead of having to guess.
+  return wibDayKey(Math.floor(time / 1000));
 }
 
 /**

@@ -83,6 +83,10 @@ const signer = require("../signer");
 const economics = require("./economics");
 const seasons = require("./seasons");
 const staminaAllowance = require("./stamina-allowance");
+// The 04:00 WIB rollover rule. Required for the day arithmetic only; every
+// business DAY KEY still comes from `content.dayKeyFor`, which delegates here,
+// so this file never names a date of its own.
+const { previousWibDayKey } = require("./reset-schedule");
 const { createMemoryStore, assertStoreShape, STORAGE_ADAPTERS, getStorageAdapter } = require("./storage");
 const relayModule = require("./relay");
 
@@ -258,23 +262,27 @@ function toUintString(value) {
 }
 
 /**
- * The UTC day immediately BEFORE `dayKey`, as `YYYY-MM-DD`.
+ * The WIB BUSINESS day immediately BEFORE `dayKey`, as `YYYY-MM-DD`.
  *
- * UTC arithmetic on the parsed calendar parts, so month, year and leap
- * boundaries are ordinary cases rather than special ones. `null` for anything
- * that is not a real `YYYY-MM-DD` day key, which the caller treats as "no
- * consecutive day" — the safe direction, since an unreadable day key must not
- * be able to buy a streak multiplier.
+ * DELEGATED TO `reset-schedule.js`, deliberately: the "is this day the day
+ * after that one" arithmetic is the same arithmetic that defines the rollover
+ * itself, so a second copy of it here would be a second rule waiting to drift.
+ * It also validates the key, which the old inline version did only by regex:
+ * `2026-02-30` is now refused as "not a real calendar day" rather than being
+ * stepped backwards into a plausible-looking neighbour. The `null` contract is
+ * preserved by catching that refusal, and `null` is still the safe answer — an
+ * unreadable day key must not be able to buy a streak multiplier.
  *
  * @param {*} dayKey Candidate day key.
- * @returns {string|null}
+ * @returns {string|null} The previous business day, or `null` when `dayKey` is
+ *   not a real `YYYY-MM-DD` day.
  */
 function previousDayKey(dayKey) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayKey));
-  if (!match) return null;
-  const asUtc = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])) - 86_400_000;
-  if (!Number.isFinite(asUtc)) return null;
-  return new Date(asUtc).toISOString().slice(0, 10);
+  try {
+    return previousWibDayKey(dayKey);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -299,7 +307,7 @@ function previousDayKey(dayKey) {
  *     repeatable escalation, so it is corrected too.
  *
  * @param {Object} streak `store.getStreak(...)` for the claiming user.
- * @param {string} dayKey The UTC day this claim is graded for.
+ * @param {string} dayKey The WIB BUSINESS day this claim is graded for, as produced by `content.dayKeyFor`.
  * @returns {number} Banked consecutive days BEFORE today: 0 when the chain is
  *   broken or absent.
  */
@@ -412,7 +420,7 @@ function readEconomyConfig({ env, clock, dailyStaminaCap } = {}) {
     floorMiners: flagNumber(source.CATT_DYNAMIC_EMISSION_FLOOR_MINERS, Number(economics.DYNAMIC_EMISSION_FLOOR_MINERS)),
     /** Rewards grow with consecutive graded days. */
     streakMultiplier: flagEnabled(source.CATT_STREAK_MULTIPLIER),
-    /** 30 free stamina points per user per UTC day, off-chain ledger only. */
+    /** 30 free stamina points per user per WIB BUSINESS day (04:00 WIB rollover), off-chain ledger only. */
     freeStamina: flagEnabled(source.CATT_FREE_STAMINA),
     /** The daily stamina SPEND ceiling, in unitless points. */
     dailyStaminaCap: cap,
@@ -1046,7 +1054,7 @@ function createApp({
      *         record happens at step 10, below, and only on a PASS — the
      *         documented risk in `economics.js`: recording first would pay
      *         tomorrow's day count for today's completion, and two missions
-     *         in one UTC day would farm a bonus day.
+     *         in one business day would farm a bonus day.
      *   (iii) THE SEASON HARD CAP IS CHECKED BEFORE THE NONCE IS RESERVED,
      *         so an exhausted season burns NOTHING: no nonce, no signature,
      *         no claim, no success. It is a dry run through the SAME decision
@@ -1060,10 +1068,31 @@ function createApp({
      */
     const nowMs = activeClock();
     const nowSeconds = Math.floor(nowMs / 1000);
+
+    /* -------------------------------------------------------------------- *
+     * THE ONE DAY KEY IN THIS ENTIRE FILE.
+     * -------------------------------------------------------------------- *
+     * Every business-day decision below — the free-stamina grant (7a), the
+     * active-miner count that drives dynamic emission (7b), the streak's
+     * consecutive-day test (7b, via `previousDayKey`), the daily stamina SPEND
+     * cap ledger (7c), the graded-completion write that advances the streak (9)
+     * and the day's spend ledger debit (10) — hangs off this ONE value.
+     *
+     * There is deliberately no second date computation anywhere in this file:
+     * a `toISOString().slice(0, 10)` or a hand-built `"YYYY-MM-DD"` here would
+     * be a 00:00-UTC day key wearing the same name as a 21:00-UTC one, and the
+     * ledger would fork the moment the two disagreed. If you need "yesterday"
+     * or "is this the next day", call `previousDayKey`/`previousWibDayKey`.
+     *
+     * THE RULE ("the Genshin rule"): the day rolls at 04:00 WIB, which is
+     * 21:00 UTC of the previous UTC calendar date, because WIB is a fixed
+     * UTC+7 with no DST. Between 21:00:00Z and 23:59:59Z this key therefore
+     * names TOMORROW's UTC date. See `reset-schedule.js` for the full argument,
+     * including why the 21 must stay a literal. */
     const dayKey = content.dayKeyFor(nowMs);
 
     /* --- 7a. DAY ROLLOVER: the free-stamina allowance. --- *
-     * 30 points per user per UTC day, ONCE per dayKey, in an off-chain
+     * 30 points per user per WIB BUSINESS day, ONCE per dayKey, in an off-chain
      * ledger. `grantFreeStamina` is idempotent by arithmetic rather than by a
      * flag, so calling it on every submit IS the rollover detection: the first
      * call of the day writes the remainder, later calls of the same day write
@@ -1103,7 +1132,7 @@ function createApp({
       effectiveResult = { ...effectiveResult, reward: priced.reward };
 
       /* --- 7c. The daily stamina SPEND cap, still 50. --- *
-       * A cap on stamina SPENT per UTC day, re-derived from the per-DAY
+       * A cap on stamina SPENT per WIB BUSINESS day (04:00 WIB rollover), re-derived from the per-DAY
        * ledger, so unspent stamina rolls over and is never confiscated. It is
        * enforced ALONGSIDE the free grant, which is 30 points AVAILABLE: the
        * grant buys access to the day's first missions, not a way past the
@@ -1197,7 +1226,7 @@ function createApp({
     /* --- 9. PASS: record the graded completion. ONLY NOW, and only here. --- *
      * Rule (ii), the other half: the streak was READ at step 7b, and the
      * record is what ADVANCES it (first ever -> 1, same day -> unchanged,
-     * immediate next UTC day -> +1, any gap or retroactive day -> reset to 1).
+     * immediate next business day -> +1, any gap or retroactive day -> reset to 1).
      * A FAIL never reaches this line, so a wrong quiz can neither inflate a
      * streak nor count its author as an active miner — and the active-miner
      * count is the input that shrinks everybody ELSE's emission. */
