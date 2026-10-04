@@ -383,7 +383,25 @@ test("parity: memory and sqlite agree on the same scripted sequence", async () =
 test("schema: user_version records the schema version a future migration bumps", async () => {
   const { store, filename } = await openStore();
   assert.equal(store._schemaVersion(), SCHEMA_VERSION);
-  assert.equal(SCHEMA_VERSION, 3, "three migrations have shipped: the base schema, the per-day growth ledgers, and seasons");
+  // DE-BRITTLED (was `SCHEMA_VERSION === 3`): the expectation is derived from
+  // MIGRATIONS instead of being written as a literal, so the next wave appending
+  // a migration does not have to edit this test to keep it green — the test that
+  // matters is "the file is stamped with the last migration's version", which is
+  // asserted below and is what actually breaks if the bump is forgotten.
+  assert.equal(
+    SCHEMA_VERSION,
+    MIGRATIONS[MIGRATIONS.length - 1].version,
+    "SCHEMA_VERSION must equal the last migration's version"
+  );
+  assert.deepEqual(
+    MIGRATIONS.map((m) => m.version),
+    Array.from({ length: SCHEMA_VERSION }, (_, index) => index + 1),
+    "migrations must be exactly 1..SCHEMA_VERSION: append-only, contiguous, never edited"
+  );
+  assert.ok(
+    MIGRATIONS.some((m) => /governor_daily_spend/.test(m.up.toString())),
+    "the daily governor budget ledger must ship as one of the migrations"
+  );
   assert.equal(
     MIGRATIONS[MIGRATIONS.length - 1].version,
     SCHEMA_VERSION,
@@ -597,6 +615,7 @@ test("uniqueness: every growth table refuses a raw duplicate INSERT in the SCHEM
   await store.recordFreeStaminaGrant({ userAddress: USER_A, dayKey: "2026-01-01", amount: 25 });
   await store.saveSeason({ id: "s1", start: 100, end: 200, allocation: BIG_REWARD, claimMode: "pro-rata" });
   await store.recordSeasonClaim({ seasonId: "s1", userAddress: USER_A, amount: BIG_REWARD, nonce: 5 });
+  await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01", amount: BIG_REWARD });
 
   /* --- and now the same rows again, in RAW SQL --------------------------- */
   // Bypassing every line of JavaScript: each of these must be refused by SQLite
@@ -642,6 +661,32 @@ test("uniqueness: every growth table refuses a raw duplicate INSERT in the SCHEM
         .run("s1", USER_A.toLowerCase(), "5"),
     /UNIQUE constraint failed: season_claims\.season_id, season_claims\.user_address, season_claims\.nonce/
   );
+  assert.throws(
+    () =>
+      db
+        .prepare("INSERT INTO governor_daily_spend (season_id, day_key, spent, updated_at) VALUES (?, ?, '1', 1)")
+        .run("s1", "2026-01-01"),
+    /UNIQUE constraint failed: governor_daily_spend\.season_id, governor_daily_spend\.day_key/
+  );
+
+  // THE FOREIGN KEY. A spend against a season that does not exist reconciles
+  // against nothing and cannot be scaled or audited, so the DATABASE refuses it
+  // with raw SQL — no line of application code is involved in this insert.
+  assert.throws(
+    () =>
+      db
+        .prepare("INSERT INTO governor_daily_spend (season_id, day_key, spent, updated_at) VALUES (?, ?, '1', 1)")
+        .run("s-never-created", "2026-01-01"),
+    /FOREIGN KEY constraint failed/
+  );
+  // And through the adapter itself, which refuses an unknown season on read and
+  // on write (the SQLite side additionally re-checks the FK in the database).
+  await assert.rejects(() => store.getGovernorSpend({ seasonId: "s-never-created", dayKey: "2026-01-01" }), /unknown season/);
+  await assert.rejects(
+    () => store.recordGovernorSpend({ seasonId: "s-never-created", dayKey: "2026-01-01", amount: "1" }),
+    /unknown season/
+  );
+  await assert.rejects(() => store.getGovernorSpendTotal({ seasonId: "s-never-created" }), /unknown season/);
 
   // And the originals are intact: a refused duplicate changes nothing.
   assert.equal((await store.getStaminaConsumed({ userAddress: USER_A, dayKey: "2026-01-01" })).consumed, "10");
@@ -649,13 +694,30 @@ test("uniqueness: every growth table refuses a raw duplicate INSERT in the SCHEM
   assert.equal((await store.getFreeStaminaGranted({ userAddress: USER_A, dayKey: "2026-01-01" })).granted, "25");
   assert.equal((await store.getSeasonClaimedTotal("s1")), BIG_REWARD);
   assert.equal(await store.countActiveMiners({ dayKey: "2026-01-01" }), 1);
+  assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), BIG_REWARD);
+  assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), BIG_REWARD);
 
   // A DIFFERENT day is a different row, not a duplicate — the property the daily
-  // cap and the free-grant ledger both depend on.
+  // stamina cap, the free-grant ledger AND the governor's daily budget all depend
+  // on: a new business day is a new bucket that starts at zero, and yesterday's
+  // spend can never be read as today's.
   db.prepare("INSERT INTO stamina_ledger (user_address, day_key, consumed, updated_at) VALUES (?, '2026-01-02', '7', 1)").run(
     USER_A.toLowerCase()
   );
   assert.equal((await store.getStaminaConsumed({ userAddress: USER_A, dayKey: "2026-01-02" })).consumed, "7");
+  db.prepare("INSERT INTO governor_daily_spend (season_id, day_key, spent, updated_at) VALUES ('s1', '2026-01-02', '7', 1)").run();
+  assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-02" }), "7");
+  assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), BIG_REWARD, "day one is untouched");
+  assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), (BigInt(BIG_REWARD) + 7n).toString());
+
+  // The governor ledger and the season claimed total are DIFFERENT QUANTITIES:
+  // the same 1e24 sits in both here only because both were written, and the
+  // governor's per-day row has no user and no nonce to be a claim record.
+  assert.equal(
+    store._raw().prepare("SELECT COUNT(*) AS n FROM governor_daily_spend").get().n,
+    2,
+    "exactly one row per (season, day): the upsert path never leaves a duplicate"
+  );
 
   // SQLite does NOT imply NOT NULL from a TEXT PRIMARY KEY, so a NULL address is
   // refused explicitly rather than letting every NULL user share one bucket.
@@ -670,8 +732,14 @@ test("schema: the growth migrations are additive, idempotent and applied in orde
   const filename = tempDbPath("migrations");
   const store = createSqliteStore({ filename });
 
-  // Only migrations above 1 are additive to the shipped base schema.
-  assert.deepEqual(MIGRATIONS.map((m) => m.version), [1, 2, 3]);
+  // DE-BRITTLED (was `MIGRATIONS.map((m) => m.version)` deepEqual `[1, 2, 3]`):
+  // derived from SCHEMA_VERSION, so appending migration 4 (and the one after
+  // that) does not turn this into a failure that has to be edited by hand.
+  assert.deepEqual(
+    MIGRATIONS.map((m) => m.version),
+    Array.from({ length: SCHEMA_VERSION }, (_, index) => index + 1),
+    "migrations are append-only: one per version, no gaps, no rewrites"
+  );
   assert.equal(MIGRATIONS[MIGRATIONS.length - 1].version, SCHEMA_VERSION);
   // Never edit a shipped migration: re-running one must be a no-op, which is
   // what `IF NOT EXISTS` everywhere buys.
@@ -696,6 +764,7 @@ test("schema: the growth migrations are additive, idempotent and applied in orde
     "free_stamina_grants",
     "seasons",
     "season_claims",
+    "governor_daily_spend",
   ]) {
     assert.ok(tables.includes(name), `missing table: ${name}`);
   }
@@ -703,6 +772,19 @@ test("schema: the growth migrations are additive, idempotent and applied in orde
   // countActiveMiners must not table-scan: its day lookup is index-served.
   const plan = store._raw().prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM daily_active_miners WHERE day_key = ?").all("2026-01-01");
   assert.match(JSON.stringify(plan), /daily_active_miners_day/, "the day filter must be served by an index");
+
+  // The governor's per-day read must likewise be the (season_id, day_key) primary
+  // key and not a scan of every season's every day.
+  const governorPlan = store
+    ._raw()
+    .prepare("EXPLAIN QUERY PLAN SELECT spent FROM governor_daily_spend WHERE season_id = ? AND day_key = ?")
+    .all("s1", "2026-01-01");
+  assert.match(
+    JSON.stringify(governorPlan),
+    /sqlite_autoindex_governor_daily_spend/,
+    "the (season, day) lookup must be served by the composite primary key index"
+  );
+  assert.equal(/SCAN governor_daily_spend/.test(JSON.stringify(governorPlan)), false, "and must never table-scan");
 
   // Re-opening is idempotent: the migration check runs again and changes nothing.
   const before = store._schemaVersion();

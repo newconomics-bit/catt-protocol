@@ -44,7 +44,8 @@ const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
 const content = require("../src/content");
-const { createSqliteStore, SCHEMA_VERSION } = require("../src/sqlite-store");
+const { createSqliteStore, SCHEMA_VERSION, MIGRATIONS } = require("../src/sqlite-store");
+const { wibDayKey } = require("../src/reset-schedule");
 const {
   createMemoryStore,
   assertStoreShape,
@@ -145,9 +146,27 @@ test("interface: both adapters implement every STORAGE_METHODS name, including t
       "getSeasonUserAccrued",
       "isSeasonClaimUsed",
       "countActiveMiners",
+      "getGovernorSpend",
+      "recordGovernorSpend",
+      "getGovernorSpendTotal",
     ];
     for (const name of growth) {
       assert.ok(STORAGE_METHODS.includes(name), `${name} must be in STORAGE_METHODS`);
+    }
+    // The governor ledger deliberately has NO reset method, and that absence is
+    // part of the contract: the caller derives `dayKey` from the WIB clock, so a
+    // new business day is a new bucket that starts at `"0"` with nothing to
+    // clear — and a reset would let a day that already emitted be zeroed and
+    // re-spent, erasing the audit trail of a season's emission.
+    assert.equal(STORAGE_METHODS.includes("resetGovernorDay"), false, "no reset: a spent day must never be zeroable");
+    assert.equal(typeof memory.resetGovernorDay, "undefined");
+    assert.equal(typeof sqlite.resetGovernorDay, "undefined");
+    // `_debugGrowth()` is a test affordance, NOT part of the contract, and both
+    // adapters must still provide it so the parity assertion can compare row
+    // counts.
+    for (const store of [memory, sqlite]) {
+      assert.equal(typeof store._debugGrowth, "function");
+      assert.equal(STORAGE_METHODS.includes("_debugGrowth"), false);
     }
     const incomplete = { ...STORAGE_METHODS };
     for (const name of growth) delete incomplete[name];
@@ -731,7 +750,190 @@ test("active miners: DISTINCT users per day, counted from graded completions onl
 });
 
 /* ========================================================================== */
-/* 9. Durability across a REAL process boundary                               */
+/* 9. The daily GOVERNOR budget ledger                                         */
+/* ========================================================================== */
+
+/**
+ * The founder's daily budget in 18-decimal base units: 110,000 CATT. 1.1e23 is
+ * BOTH far above 2^53 (lossy as a JavaScript number) and OUT OF RANGE for a
+ * signed 64-bit SQLite INTEGER (ceiling 9223372036854775807), so this single
+ * constant is simultaneously the "exact above 2^53" and the "TEXT discipline"
+ * case. Written here as the product of two `BigInt`s so no part of the test
+ * itself passes through a lossy number.
+ */
+const DAILY_BUDGET = (110000n * 10n ** 18n).toString();
+/** The season allocation it is drawn from: 3,300,000 CATT over a 30-day window. */
+const SEASON_ALLOCATION = (3300000n * 10n ** 18n).toString();
+
+test("governor: accumulates within a business day, starts a new one at zero, and is exact", async () => {
+  await bothAdapters("governor", async (store) => {
+    await store.saveSeason({ id: "s1", start: 100, end: 200, allocation: SEASON_ALLOCATION, claimMode: "pro-rata" });
+
+    // An untouched day is exactly "0", as a canonical DECIMAL STRING (never a
+    // number: a 1e23 budget cannot survive a double).
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), "0");
+    assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), "0");
+
+    // ACCUMULATES, NEVER REPLACES, and the returned running total increases
+    // MONOTONICALLY with every write — that is what the reward path reads to
+    // decide whether to scale a reward down.
+    const running = [];
+    for (const amount of [DAILY_BUDGET, "1", HUGE, HUGE_CATT]) {
+      running.push(BigInt(await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01", amount })));
+    }
+    for (let i = 1; i < running.length; i += 1) {
+      assert.ok(running[i] > running[i - 1], `write #${i} did not increase the running total`);
+    }
+    const dayOne = running[running.length - 1];
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), dayOne.toString());
+    assert.equal(typeof (await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" })), "string");
+
+    // EXACTNESS, twice over: 2^53 + 1 cannot survive a JS number and 1e24
+    // cannot survive a signed 64-bit SQLite INTEGER. The sum below is computed
+    // with BigInt, and it must be what both adapters return.
+    const expectedDayOne = (BigInt(DAILY_BUDGET) + 1n + BigInt(HUGE) + BigInt(HUGE_CATT)).toString();
+    assert.equal(dayOne.toString(), expectedDayOne);
+    assert.notEqual(dayOne.toString(), (BigInt(DAILY_BUDGET) + 2n + BigInt(HUGE) + BigInt(HUGE_CATT)).toString());
+
+    // A NEW dayKey STARTS AT ZERO and does not carry yesterday's spend. This is
+    // the whole reason there is no reset method: the rollover is a new bucket,
+    // not a mutation of the old one.
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-02" }), "0");
+    assert.equal(await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-01-02", amount: "7" }), "7");
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), expectedDayOne, "day one is untouched");
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-03" }), "0", "a day nobody spent is zero");
+
+    // The season TOTAL accumulates across days, exactly.
+    assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), (BigInt(expectedDayOne) + 7n).toString());
+
+    // SEASONS ARE INDEPENDENT: a second season's budget is its own.
+    await store.saveSeason({ id: "s2", start: 300, end: 400, allocation: SEASON_ALLOCATION, claimMode: "flat" });
+    assert.equal(await store.getGovernorSpend({ seasonId: "s2", dayKey: "2026-01-01" }), "0");
+    assert.equal(await store.getGovernorSpendTotal({ seasonId: "s2" }), "0");
+    await store.recordGovernorSpend({ seasonId: "s2", dayKey: "2026-01-01", amount: DAILY_BUDGET });
+    assert.equal(await store.getGovernorSpend({ seasonId: "s2", dayKey: "2026-01-01" }), DAILY_BUDGET);
+    assert.equal(await store.getGovernorSpendTotal({ seasonId: "s2" }), DAILY_BUDGET);
+    assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), (BigInt(expectedDayOne) + 7n).toString(), "s1 is unaffected");
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-02" }), "7");
+
+    // Exactly ONE ROW per (season, day), however many times the day was written:
+    // the upsert must never leave a duplicate behind.
+    assert.equal(store._debugGrowth().governorSpend, 3, "two (season, day) buckets for s1 and one for s2");
+
+    // A season that does not exist is refused on read and on write alike — a
+    // spend that reconciles against nothing is not a spend. The SQLite adapter
+    // additionally enforces it in the SCHEMA (FOREIGN KEY), proven with raw SQL
+    // in test/sqlite-store.test.js.
+    for (const call of [
+      () => store.getGovernorSpend({ seasonId: "s-never", dayKey: "2026-01-01" }),
+      () => store.recordGovernorSpend({ seasonId: "s-never", dayKey: "2026-01-01", amount: "1" }),
+      () => store.getGovernorSpendTotal({ seasonId: "s-never" }),
+    ]) {
+      await assert.rejects(call, /unknown season/);
+    }
+
+    // Malformed amounts and day keys are refused identically in both adapters.
+    for (const bad of [-1, 1.5, "1.5", "abc", NaN, null, undefined, {}, "-1"]) {
+      await assert.rejects(
+        () => store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01", amount: bad }),
+        TypeError,
+        `amount ${String(bad)} must be refused`
+      );
+    }
+    for (const bad of ["2026-02-30", "not-a-day", 20260101, null]) {
+      await assert.rejects(
+        () => store.getGovernorSpend({ seasonId: "s1", dayKey: bad }),
+        TypeError,
+        `dayKey ${String(bad)} must be refused`
+      );
+    }
+  });
+});
+
+test("governor: the daily budget counter and the season claimed total are DIFFERENT quantities", async () => {
+  await bothAdapters("governor-vs-claims", async (store) => {
+    await store.saveSeason({ id: "s1", start: 100, end: 200, allocation: SEASON_ALLOCATION, claimMode: "pro-rata" });
+
+    // The scenario the distinction exists for: a reward of 200 CATT arrives, the
+    // governor holds 100 CATT of it back because the day's budget is nearly
+    // spent, and the user is signed for the SCALED value. What was committed
+    // against the budget is 200; what was settled is 100.
+    const scale = BigInt(DAILY_BUDGET) - BigInt(DAILY_BUDGET) / 2n;
+    await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01", amount: scale });
+    const settlement = await store.recordSeasonClaim({ seasonId: "s1", userAddress: USER_A, amount: (scale / 2n).toString(), nonce: 1 });
+
+    // The claim settled HALF of what the governor committed — the two totals are
+    // not two views of one number, and neither is derived from the other.
+    assert.equal(settlement.seasonClaimedTotal, (scale / 2n).toString());
+    assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), scale.toString());
+    assert.notEqual(await store.getGovernorSpendTotal({ seasonId: "s1" }), await store.getSeasonClaimedTotal("s1"));
+
+    // A settlement alone moves NO budget: `season_claims` is a record of what was
+    // paid out, and the governor counts what was committed. Deriving one from
+    // the other in either direction would be a bug, so neither call site in
+    // either adapter reads the other table.
+    await store.recordSeasonClaim({ seasonId: "s1", userAddress: USER_B, amount: "5", nonce: 1 });
+    assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), scale.toString(), "a claim does not spend budget");
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), scale.toString());
+
+    // And budget alone does not settle anything: the claimed total is untouched
+    // by the governor write above.
+    assert.equal(await store.getSeasonClaimedTotal("s1"), (scale / 2n + 5n).toString());
+    assert.equal(await store.getSeasonUserAccrued({ seasonId: "s1", userAddress: USER_A }), (scale / 2n).toString());
+
+    // The two live in DIFFERENT tables with different keys, which is the
+    // structural form of the same statement.
+    assert.equal(store._debugGrowth().governorSpend, 1, "one (season, day) row");
+    assert.equal(store._debugGrowth().seasonClaims, 2, "two (season, user, nonce) rows");
+  });
+});
+
+test("governor: dayKey is the WIB BUSINESS day, so 23:55 WIB and 05:00 WIB are DIFFERENT rows", async () => {
+  await bothAdapters("governor-wib", async (store) => {
+    await store.saveSeason({ id: "s1", start: 100, end: 200, allocation: SEASON_ALLOCATION, claimMode: "pro-rata" });
+
+    // 23:55 WIB on 2026-01-02 is 16:55 UTC on 2026-01-02 — still the 2nd for the
+    // player, because the day has not rolled until 04:00 WIB.
+    const lateEvening = Math.floor(Date.UTC(2026, 0, 2, 16, 55, 0) / 1000);
+    // 05:00 WIB on 2026-01-03 is 22:00 UTC on 2026-01-02 — the SAME UTC calendar
+    // date as the instant above, but the 3rd for the player.
+    const earlyMorning = Math.floor(Date.UTC(2026, 0, 2, 22, 0, 0) / 1000);
+    const lateKey = wibDayKey(lateEvening);
+    const earlyKey = wibDayKey(earlyMorning);
+    assert.equal(lateKey, "2026-01-02");
+    assert.equal(earlyKey, "2026-01-03");
+    assert.notEqual(earlyKey, lateKey, "the two instants differ in business day");
+    assert.equal(
+      new Date(lateEvening * 1000).toISOString().slice(0, 10),
+      new Date(earlyMorning * 1000).toISOString().slice(0, 10),
+      "and share the SAME UTC date — which is exactly why a UTC-keyed ledger would get this wrong"
+    );
+
+    // The store stores whatever the caller hands it, verbatim: the ledger is keyed
+    // by the WIB business day because the CALLER says so, and reads back the same.
+    assert.equal(await store.recordGovernorSpend({ seasonId: "s1", dayKey: lateKey, amount: DAILY_BUDGET }), DAILY_BUDGET);
+    assert.equal(await store.recordGovernorSpend({ seasonId: "s1", dayKey: earlyKey, amount: "1" }), "1");
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: lateKey }), DAILY_BUDGET);
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: earlyKey }), "1");
+    assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), (BigInt(DAILY_BUDGET) + 1n).toString());
+    assert.equal(store._debugGrowth().governorSpend, 2, "two business days, two rows");
+
+    // THE BOUNDARY ITSELF, half-open at 21:00 UTC: one second before it the
+    // player is still on the 2nd, at it the day has ALREADY rolled to the 3rd.
+    const justBefore = wibDayKey(Math.floor(Date.UTC(2026, 0, 2, 20, 59, 59) / 1000));
+    const exactlyAt = wibDayKey(Math.floor(Date.UTC(2026, 0, 2, 21, 0, 0) / 1000));
+    assert.equal(justBefore, "2026-01-02");
+    assert.equal(exactlyAt, "2026-01-03");
+
+    // And the same rule the other ledgers follow: a padded day key is normalised
+    // to the canonical form on both sides of the call.
+    assert.equal(await store.recordGovernorSpend({ seasonId: "s1", dayKey: " 2026-01-04 ", amount: "2" }), "2");
+    assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-04" }), "2");
+  });
+});
+
+/* ========================================================================== */
+/* 10. Durability across a REAL process boundary                              */
 /* ========================================================================== */
 
 test("durability: a child process opened with `node -e` reads back every growth row", async () => {
@@ -750,6 +952,15 @@ test("durability: a child process opened with `node -e` reads back every growth 
   await writer.saveSeason({ id: "s1", start: 100, end: 200, allocation: HUGE_CATT, claimMode: "pro-rata" });
   await writer.saveSeason({ id: "s-open", start: 300, end: null, allocation: "5", claimMode: "flat" });
   await writer.recordSeasonClaim({ seasonId: "s1", userAddress: USER_A, amount: HUGE_CATT, nonce: 7 });
+  // The governor ledger is committed too, on the SAME season and the SAME days,
+  // so the child's read-back proves the two tables are independent and both
+  // durable — a claim and a budget spend for the same day must not collapse into
+  // one number.
+  for (const dayKey of DAYS) {
+    await writer.recordGovernorSpend({ seasonId: "s1", dayKey, amount: DAILY_BUDGET });
+    await writer.recordGovernorSpend({ seasonId: "s1", dayKey, amount: HUGE });
+  }
+  await writer.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-07-04", amount: "3" });
 
   // The file must be closed before the child opens it: that is the whole point.
   await writer.close();
@@ -779,12 +990,23 @@ test("durability: a child process opened with `node -e` reads back every growth 
         userAccrued: await store.getSeasonUserAccrued({ seasonId: "s1", userAddress: ${JSON.stringify(USER_A)} }),
         claimUsed: await store.isSeasonClaimUsed({ seasonId: "s1", userAddress: ${JSON.stringify(USER_A)}, nonce: 7 }),
         claimUnused: await store.isSeasonClaimUsed({ seasonId: "s1", userAddress: ${JSON.stringify(USER_A)}, nonce: 8 }),
+        governorDays: [],
+        governorTotal: await store.getGovernorSpendTotal({ seasonId: "s1" }),
+        governorUnknownSeason: await store.getGovernorSpend({ seasonId: "s-never", dayKey: "2026-07-01" }).then(
+          () => "resolved",
+          (err) => "rejected: " + /unknown season/.test(String(err && err.message))
+        ),
+        governorGrowthRows: store._debugGrowth().governorSpend,
       };
       for (const dayKey of days) {
         out.stamina.push(await store.getStaminaConsumed({ userAddress: ${JSON.stringify(USER_A)}, dayKey }));
         out.free.push(await store.getFreeStaminaGranted({ userAddress: ${JSON.stringify(USER_A)}, dayKey }));
         out.miners.push(await store.countActiveMiners({ dayKey }));
+        out.governorDays.push(await store.getGovernorSpend({ seasonId: "s1", dayKey }));
       }
+      // One extra day, past the loop's three: it must be there too, and the
+      // per-season total must be the sum of ALL FOUR days.
+      out.governorExtraDay = await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-07-04" });
       // The schema constraints are still in force in a fresh process.
       let duplicateRejected = null;
       try {
@@ -795,6 +1017,27 @@ test("durability: a child process opened with `node -e` reads back every growth 
         duplicateRejected = err.message;
       }
       out.duplicateRejected = duplicateRejected;
+      // The governor's duplicate (season, day) is refused by the SCHEMA in the
+      // fresh process too — this table is not one process's memory.
+      let governorDuplicateRejected = null;
+      try {
+        store._raw()
+          .prepare("INSERT INTO governor_daily_spend (season_id, day_key, spent, updated_at) VALUES ('s1', '2026-07-01', '1', 1)")
+          .run();
+      } catch (err) {
+        governorDuplicateRejected = err.message;
+      }
+      out.governorDuplicateRejected = governorDuplicateRejected;
+      // And so is its FOREIGN KEY to seasons(id), with no adapter code involved.
+      let governorForeignKeyRejected = null;
+      try {
+        store._raw()
+          .prepare("INSERT INTO governor_daily_spend (season_id, day_key, spent, updated_at) VALUES ('s-never', '2026-07-01', '1', 1)")
+          .run();
+      } catch (err) {
+        governorForeignKeyRejected = err.message;
+      }
+      out.governorForeignKeyRejected = governorForeignKeyRejected;
       await store.close();
       process.stdout.write(JSON.stringify(out));
     })().catch((err) => {
@@ -810,7 +1053,20 @@ test("durability: a child process opened with `node -e` reads back every growth 
   // The schema version lives in the FILE, so the child proves which schema it
   // read — and it must be exactly the version this build publishes.
   assert.equal(seen.schemaVersion, SCHEMA_VERSION);
-  assert.ok(SCHEMA_VERSION >= 3, "the growth tables are migrations on top of the base schema");
+  // DE-BRITTLED (was a hardcoded `SCHEMA_VERSION >= 3`): derived from the code
+  // rather than written as a literal, so the next migration does not turn this
+  // assertion into a stale one. The lower bound that IS meaningful — that the
+  // growth tables are migrations ON TOP of a base schema — is now expressed as a
+  // count: one migration per version above 1.
+  assert.equal(
+    MIGRATIONS.length,
+    SCHEMA_VERSION,
+    "one migration per version: the base schema plus every ledger on top of it"
+  );
+  assert.ok(
+    SCHEMA_VERSION - 1 >= 3,
+    "at least three migrations sit above the base schema (per-day ledgers, seasons, governor)"
+  );
 
   // Per-day ledgers survived, exactly, in all three days.
   assert.deepEqual(seen.stamina, DAYS.map((dayKey) => ({
@@ -848,10 +1104,109 @@ test("durability: a child process opened with `node -e` reads back every growth 
 
   // And the schema constraint is not a property of one process's memory.
   assert.match(seen.duplicateRejected, /UNIQUE constraint failed: stamina_ledger/);
+
+  /* --- the governor ledger survived the same process boundary ------------ */
+  // Per-day, exactly: each of the three days carries a whole daily budget plus
+  // the 2^53+1 probe, and none of them carries anything from another day.
+  assert.deepEqual(
+    seen.governorDays,
+    DAYS.map(() => (BigInt(DAILY_BUDGET) + BigInt(HUGE)).toString()),
+    "the daily budget counters survived, per business day, with no rounding"
+  );
+  assert.equal(seen.governorExtraDay, "3", "a fourth business day is still its own row");
+  assert.equal(
+    seen.governorTotal,
+    (3n * (BigInt(DAILY_BUDGET) + BigInt(HUGE)) + 3n).toString(),
+    "the season total is the sum of ALL FOUR days, not the three the loop wrote"
+  );
+  assert.equal(seen.governorGrowthRows, 4, "exactly one row per (season, day) survived");
+  assert.equal(
+    seen.governorUnknownSeason,
+    "rejected: true",
+    "an unknown season is still refused in a fresh process, on both adapters"
+  );
+
+  // THE GOVERNOR AND THE CLAIM LEDGER ARE DIFFERENT NUMBERS for the same season:
+  // the claim settled HUGE_CATT on day one, while the day-one budget counter is
+  // a whole daily budget. If either had been derived from the other, one of these
+  // two assertions would have changed.
+  assert.equal(seen.claimedTotal, HUGE_CATT);
+  assert.notEqual(seen.governorTotal, HUGE_CATT);
+
+  // The governor's constraints are in the SCHEMA, in this process as well.
+  assert.match(
+    seen.governorDuplicateRejected,
+    /UNIQUE constraint failed: governor_daily_spend\.season_id, governor_daily_spend\.day_key/
+  );
+  assert.match(seen.governorForeignKeyRejected, /FOREIGN KEY constraint failed/);
+});
+
+test("migrations: re-running the path on a current file is a no-op, and a v3 file upgrades IN PLACE", async () => {
+  /* --- (a) idempotence on an already-current file ----------------------- */
+  const filename = tempDbPath("idempotent");
+  const store = createSqliteStore({ filename });
+  await store.saveSeason({ id: "s1", start: 100, end: 200, allocation: SEASON_ALLOCATION, claimMode: "pro-rata" });
+  await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01", amount: DAILY_BUDGET });
+  await store.recordStaminaConsumption({ userAddress: USER_A, dayKey: "2026-01-01", amount: 10 });
+  const before = { version: store._schemaVersion(), growth: store._debugGrowth() };
+  assert.equal(before.version, SCHEMA_VERSION);
+  await store.close();
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const reopened = createSqliteStore({ filename });
+    await reopened.init();
+    await reopened.init();
+    assert.equal(reopened._schemaVersion(), SCHEMA_VERSION, `re-open #${attempt} changed the version`);
+    assert.deepEqual(reopened._debugGrowth(), before.growth, `re-open #${attempt} lost or duplicated a row`);
+    assert.equal(await reopened.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), DAILY_BUDGET);
+    await reopened.close();
+  }
+
+  /* --- (b) a LEGACY v3 file migrates in place, with its data intact ------ */
+  const legacyFile = tempDbPath("legacy-v3");
+  const legacy = createSqliteStore({ filename: legacyFile });
+  await legacy.saveSeason({ id: "s1", start: 100, end: 200, allocation: SEASON_ALLOCATION, claimMode: "pro-rata" });
+  await legacy.recordSeasonClaim({ seasonId: "s1", userAddress: USER_A, amount: HUGE_CATT, nonce: 1 });
+  await legacy.recordStaminaConsumption({ userAddress: USER_A, dayKey: "2026-01-01", amount: 10 });
+  // Rewind the file to exactly what migration 3 shipped: `user_version = 3` and
+  // no governor table. Nothing else is touched, so this really is a v3 database.
+  legacy._raw().exec("DROP TABLE governor_daily_spend");
+  legacy._raw().pragma("user_version = 3");
+  assert.equal(legacy._schemaVersion(), 3);
+  await legacy.close();
+
+  const upgraded = createSqliteStore({ filename: legacyFile });
+  await upgraded.init();
+  assert.equal(upgraded._schemaVersion(), SCHEMA_VERSION, "the outstanding migration is applied on open");
+  const upgradedTables = upgraded
+    ._raw()
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+    .all()
+    .map((row) => row.name);
+  assert.ok(upgradedTables.includes("governor_daily_spend"), "migration 4 created the governor table");
+
+  // ITS DATA IS INTACT: every migration-1..3 ledger survived untouched, and the
+  // new ledger starts empty for the old season.
+  assert.equal(upgraded._debugGrowth().governorSpend, 0);
+  assert.equal((await upgraded.getStaminaConsumed({ userAddress: USER_A, dayKey: "2026-01-01" })).consumed, "10");
+  assert.equal(await upgraded.getSeasonClaimedTotal("s1"), HUGE_CATT);
+  assert.equal((await upgraded.getSeason("s1")).allocation, SEASON_ALLOCATION);
+  assert.equal(await upgraded.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), "0");
+  // ...and it is immediately usable, on the season the old file already had.
+  assert.equal(await upgraded.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01", amount: DAILY_BUDGET }), DAILY_BUDGET);
+  assert.equal(await upgraded.getGovernorSpendTotal({ seasonId: "s1" }), DAILY_BUDGET);
+  await upgraded.close();
+
+  // And the upgraded file is stable across further re-opens.
+  const again = createSqliteStore({ filename: legacyFile });
+  await again.init();
+  assert.equal(again._schemaVersion(), SCHEMA_VERSION);
+  assert.equal(await again.getGovernorSpendTotal({ seasonId: "s1" }), DAILY_BUDGET);
+  await again.close();
 });
 
 /* ========================================================================== */
-/* 10. Memory <-> SQLite parity over every new method                         */
+/* 11. Memory <-> SQLite parity over every new method                         */
 /* ========================================================================== */
 
 test("PARITY: every growth method returns IDENTICAL views from both adapters", async () => {
@@ -925,6 +1280,45 @@ test("PARITY: every growth method returns IDENTICAL views from both adapters", a
       // duplicate of USER_A, so the day's count goes up by exactly one however
       // many times it is recorded.
       out.minersDay1AfterMixed = await store.countActiveMiners({ dayKey: "2026-08-01" });
+
+      // The GOVERNOR LEDGER, driven through the same script on both adapters:
+      // an empty day, several accumulating writes on one business day, a second
+      // day, a second season, the lifetime total, and the same cross-check that
+      // distinguishes it from the season claimed total above.
+      out.governorEmpty = await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-08-04" });
+      out.governorTotalEmpty = await store.getGovernorSpendTotal({ seasonId: "s1" });
+      out.governorDay4a = await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-08-04", amount: DAILY_BUDGET });
+      out.governorDay4b = await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-08-04", amount: "1" });
+      out.governorDay4c = await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-08-04", amount: HUGE_CATT });
+      out.governorDay5 = await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-08-05", amount: HUGE });
+      out.governorDay4 = await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-08-04" });
+      out.governorDay5Read = await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-08-05" });
+      out.governorDay6 = await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-08-06" });
+      // A different season: its own budget, unaffected by s1's.
+      out.governorOtherSeasonEmpty = await store.getGovernorSpend({ seasonId: "s-open", dayKey: "2026-08-04" });
+      out.governorOtherSeason = await store.recordGovernorSpend({ seasonId: "s-open", dayKey: "2026-08-04", amount: "5" });
+      out.governorTotal = await store.getGovernorSpendTotal({ seasonId: "s1" });
+      out.governorTotalOther = await store.getGovernorSpendTotal({ seasonId: "s-open" });
+      // The budget counter is NOT the claim record: `s1` has one claim of
+      // HUGE_CATT, so if these two totals were ever derived from one another the
+      // deepEqual below would not be comparing two independent quantities.
+      out.governorTotalVsClaimed = await store.getGovernorSpendTotal({ seasonId: "s1" });
+      out.seasonTotalAfterGovernor = await store.getSeasonClaimedTotal("s1");
+      // An unknown season is refused on read, on write and on the total, in BOTH
+      // adapters — recorded as a boolean because the two adapters legitimately
+      // word the refusal differently.
+      out.governorUnknown = await Promise.all(
+        [
+          () => store.getGovernorSpend({ seasonId: "s-never", dayKey: "2026-08-04" }),
+          () => store.recordGovernorSpend({ seasonId: "s-never", dayKey: "2026-08-04", amount: "1" }),
+          () => store.getGovernorSpendTotal({ seasonId: "s-never" }),
+        ].map((call) =>
+          call().then(
+            () => "resolved",
+            (err) => (/unknown season/.test(String(err && err.message)) ? "refused" : `unexpected: ${String(err && err.message)}`)
+          )
+        )
+      );
       return out;
     }
 
@@ -933,6 +1327,20 @@ test("PARITY: every growth method returns IDENTICAL views from both adapters", a
     // `undefined` does not survive JSON and does not need to: every entry is
     // either a value or an explicit undefined, and deepEqual compares both.
     assert.deepEqual(b, a, "the two adapters disagreed about the growth ledgers");
+
+    // ROW COUNTS, not just totals. A duplicated (season, day) row would still sum
+    // correctly through the public API, so the counts are the evidence that the
+    // upsert path left exactly one row per bucket in BOTH adapters.
+    assert.deepEqual(sqlite._debugGrowth(), memory._debugGrowth(), "the two adapters disagree about how many rows they hold");
+    assert.deepEqual(sqlite._debugGrowth(), {
+      staminaLedger: 3,
+      streaks: 2,
+      activeMiners: 5,
+      freeGrants: 1,
+      seasons: 2,
+      seasonClaims: 2,
+      governorSpend: 3,
+    });
 
     // Named again, so a failure says WHICH behaviour broke.
     assert.deepEqual(b.emptyStamina.consumed, "0");
@@ -955,6 +1363,36 @@ test("PARITY: every growth method returns IDENTICAL views from both adapters", a
     assert.deepEqual([b.minersDay0, b.minersDay2, b.minersDay3, b.minersDay9], [1, 1, 0, 1]);
     assert.deepEqual(b.minersDay1AfterMixed, 2, "a second wallet adds exactly one active user");
     assert.deepEqual(b.mixedStaminaRead.consumed, "5", "one wallet, one bucket, whatever the casing");
+
+    // Governor spot-checks, named so a parity failure says WHICH behaviour broke.
+    assert.deepEqual(b.governorEmpty, "0", "an untouched business day is zero");
+    assert.deepEqual(b.governorTotalEmpty, "0");
+    assert.deepEqual(b.governorDay4a, DAILY_BUDGET, "a whole daily budget is exact, not rounded");
+    assert.deepEqual(b.governorDay4b, (BigInt(DAILY_BUDGET) + 1n).toString(), "accumulate, never replace");
+    assert.deepEqual(b.governorDay4c, (BigInt(DAILY_BUDGET) + 1n + BigInt(HUGE_CATT)).toString());
+    assert.deepEqual(b.governorDay4, (BigInt(DAILY_BUDGET) + 1n + BigInt(HUGE_CATT)).toString());
+    assert.deepEqual(b.governorDay5Read, HUGE, "a 1e23/2^53-scale day is exact too");
+    assert.deepEqual(b.governorDay6, "0", "a day-A spend never leaks into day B");
+    assert.deepEqual(b.governorOtherSeasonEmpty, "0", "seasons have separate budgets");
+    assert.deepEqual(b.governorOtherSeason, "5");
+    assert.deepEqual(
+      b.governorTotal,
+      (BigInt(DAILY_BUDGET) + 1n + BigInt(HUGE_CATT) + BigInt(HUGE)).toString(),
+      "the lifetime total sums across days"
+    );
+    assert.deepEqual(b.governorTotalOther, "5", "and is independent between seasons");
+    assert.deepEqual(b.governorTotalVsClaimed, b.governorTotal, "the total is stable");
+    assert.deepEqual(
+      b.seasonTotalAfterGovernor,
+      (BigInt(HUGE_CATT) + 7n).toString(),
+      "the claimed total is UNCHANGED by the governor writes — different quantities"
+    );
+    assert.deepEqual(
+      b.governorTotalVsClaimed === b.seasonTotalAfterGovernor,
+      false,
+      "the governor total and the claimed total must not be the same number"
+    );
+    assert.deepEqual(b.governorUnknown, ["refused", "refused", "refused"], "an unknown season is refused in both adapters");
   } finally {
     await sqlite.close();
   }

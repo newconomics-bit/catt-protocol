@@ -176,8 +176,60 @@
  *     become retroactively unreviewable and un-auditable. The cap belongs at
  *     READ time, where it can change without rewriting history.
  *
- * POSTGRES DDL for these tables is documented beside the migration list in
- * `./sqlite-store.js`, next to the SQLite version it mirrors.
+ * ===========================================================================
+ * THE GOVERNOR LEDGER (`getGovernorSpend` … `getGovernorSpendTotal`)
+ * ===========================================================================
+ * Founder Strategy S1+S2 adds a GOVERNOR: a season runs for a 30-day window
+ * and emits at most a fixed DAILY budget (110,000 CATT/day against a
+ * 3,300,000 CATT season allocation). Before the reward path scales a reward
+ * down it must ask one question — HOW MUCH OF TODAY'S BUDGET IS ALREADY SPENT —
+ * and that question is answered by exactly one row per (season, business day).
+ *
+ * GOVERNOR SPEND IS NOT `season_claims`. THE DISTINCTION IS LOAD-BEARING:
+ *   `season_claims` (recordSeasonClaim / getSeasonClaimedTotal) is the
+ *   SETTLEMENT RECORD: one immutable row per (season, user, nonce), the audit
+ *   trail of what a specific wallet was actually credited, idempotent on its
+ *   nonce, and the number reconciled against the season allocation at
+ *   settlement.
+ *   the governor ledger (getGovernorSpend / recordGovernorSpend) is the BUDGET
+ *   COUNTER: one mutable running total per (season, day), with no user, no
+ *   nonce and no idempotency, because what it answers is "how much of TODAY is
+ *   gone", not "what did anyone claim".
+ *   They are DIFFERENT QUANTITIES and are never derived from one another. A
+ *   reward that is scaled down to fit the daily budget still lands in
+ *   `season_claims` at its SCALED value, so the two can differ for the same
+ *   event by exactly the amount the governor held back. Deriving the daily
+ *   counter from `season_claims` would be wrong in both directions at once: a
+ *   settlement record cannot answer "how much of today" (it is per user, and
+ *   counting only graded claims would miss every other way emission leaves the
+ *   Judge), and a budget counter cannot answer "what was this user credited"
+ *   (it has no user dimension at all). This file keeps them as two tables with
+ *   two jobs; the Postgres DDL for the new one is beside the migration list in
+ *   `./sqlite-store.js`.
+ *
+ * SAME ONE RULE AS EVERY OTHER LEDGER HERE: `dayKey` IS A CALLER-SUPPLIED
+ * `YYYY-MM-DD` WIB BUSINESS-DAY STRING (see `reset-schedule.js`, which rolls at
+ * 21:00 UTC / 04:00 WIB) AND THE STORE NEVER READS A CLOCK. Nothing in this
+ * ledger derives a day, expires a day, or carries a day forward: a new
+ * `dayKey` starts at `"0"` by construction, which is why there is no reset
+ * method (see `recordGovernorSpend` below) and why yesterday's spend can never
+ * be mistaken for today's.
+ *
+ * `spent` is a CANONICAL DECIMAL STRING, never a number. A daily budget is an
+ * 18-decimal CATT amount: 110,000 CATT is 1.1e23 base units, which is not
+ * merely imprecise as a JavaScript double (it is past 2^53) but OUT OF RANGE
+ * for a signed 64-bit SQLite INTEGER, which tops out at 9.22e18. A ledger that
+ * rounds a daily budget can overshoot the very ceiling it exists to enforce.
+ *
+ * A `season_id` THAT NAMES NO SEASON IS REFUSED. A budget row for a season that
+ * does not exist is a spend that reconciles against nothing and cannot be
+ * scaled or audited, so the SQLite adapter enforces this with a FOREIGN KEY to
+ * `seasons(id)` and the memory store checks the same thing in application code
+ * — the two must agree, or a caller would get a working ledger on one adapter
+ * and a refusal on the other.
+ *
+ * POSTGRES DDL for the governor table is documented beside the migration list
+ * in `./sqlite-store.js`, next to the SQLite version it mirrors.
  *
  * ===========================================================================
  * STORAGE ADAPTERS (`STORAGE_ADAPTERS` below)
@@ -244,6 +296,12 @@ const STORAGE_METHODS = Object.freeze([
   "getSeasonUserAccrued",
   "isSeasonClaimUsed",
   "countActiveMiners",
+  // Governor ledger: the per-DAY, per-SEASON emission budget counter. A
+  // different quantity from the season claimed total above — see the header
+  // note on why the two are never derived from one another.
+  "getGovernorSpend",
+  "recordGovernorSpend",
+  "getGovernorSpendTotal",
   "close",
   "dispose",
 ]);
@@ -426,6 +484,8 @@ function createMemoryStore() {
   const seasonClaims = new Map();
   /** @type {Map<string, Set<string>>} Distinct users active per day, keyed by day key. */
   const activeMiners = new Map();
+  /** @type {Map<string, bigint>} Governor emission SPENT per day, keyed `${seasonId}|${dayKey}`. */
+  const governorSpend = new Map();
   /** Monotonic submission id. Starts at 1 so id 0 is never a valid id. */
   let nextSubmissionId = 1;
   /** Monotonic insertion counter used to give telemetry a stable order. */
@@ -535,6 +595,61 @@ function createMemoryStore() {
     let total = 0n;
     for (const [key, value] of seasonClaims.entries()) {
       if (key.startsWith(`${seasonId}|${userAddress}|`)) total += value;
+    }
+    return total;
+  }
+
+  /**
+   * The key a governor ledger row is stored under.
+   *
+   * There is NO user dimension here and that is deliberate: the counter answers
+   * "how much of TODAY'S season budget is already committed", which is a
+   * property of the (season, day) bucket and nothing else. There is no
+   * address to normalise, and no nonce, so there is nothing here that two
+   * spellings of the same value could disagree about.
+   *
+   * @param {string} seasonId Season id.
+   * @param {string} dayKey Canonical `YYYY-MM-DD` WIB business day.
+   * @returns {string} Storage key.
+   */
+  function governorKey(seasonId, dayKey) {
+    return `${seasonId}|${dayKey}`;
+  }
+
+  /**
+   * Canonical season id, refusing one that names no season.
+   *
+   * The SQLite adapter gets this from a FOREIGN KEY to `seasons(id)`; the
+   * memory store has to say the same thing in application code, or the two
+   * adapters would disagree about whether an unknown season is writable. The
+   * refusal is the safe direction: a budget row for a season that does not
+   * exist reconciles against nothing.
+   *
+   * @param {*} seasonId Candidate season id.
+   * @returns {string} The canonical season id.
+   * @throws {Error} If no such season has been saved.
+   */
+  function knownSeason(seasonId) {
+    const season = String(seasonId);
+    if (!seasons.has(season)) {
+      throw new Error(
+        `store: governor spend references unknown season ${JSON.stringify(season)}. ` +
+          "A daily emission budget belongs to a season row that exists."
+      );
+    }
+    return season;
+  }
+
+  /**
+   * Everything one season has spent against its daily budgets, across every day.
+   *
+   * @param {string} seasonId Season id.
+   * @returns {bigint}
+   */
+  function governorSeasonTotal(seasonId) {
+    let total = 0n;
+    for (const [key, value] of governorSpend.entries()) {
+      if (key.startsWith(`${seasonId}|`)) total += value;
     }
     return total;
   }
@@ -1397,6 +1512,99 @@ function createMemoryStore() {
       return bucket ? bucket.size : 0;
     },
 
+    /* ------------------------------------------------------------------ *
+     * The GOVERNOR LEDGER: one running total per (season, day).           *
+     * NOT the season claimed total — see the header note.                  *
+     * ------------------------------------------------------------------ */
+
+    /**
+     * How much of TODAY's season emission budget is already committed, as a
+     * canonical decimal string. `"0"` when nothing has been committed.
+     *
+     * This is the number the reward path scales a reward DOWN by, so it must be
+     * the budget counter and nothing else: `season_claims` cannot answer it (it
+     * is per user and per nonce, and it records what was SETTLED rather than
+     * what was committed), and conflating the two would make a day's budget
+     * depend on which wallets happened to settle.
+     *
+     * `dayKey` is the caller-supplied WIB BUSINESS day (`wibDayKey`, which rolls
+     * at 21:00 UTC / 04:00 WIB). The store never derives it and never expires
+     * it, which is exactly why a brand-new day is `"0"` with no reset step:
+     * there is no row to clear and no code path by which yesterday's spend can
+     * be read as today's.
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season whose budget is being measured.
+     * @param {string} params.dayKey `YYYY-MM-DD` WIB business day.
+     * @returns {Promise<string>} Canonical decimal string; `"0"` when nothing.
+     * @throws {TypeError} If `dayKey` is not a real `YYYY-MM-DD` calendar day.
+     * @throws {Error} If `seasonId` names no season.
+     */
+    async getGovernorSpend({ seasonId, dayKey } = {}) {
+      const season = knownSeason(seasonId);
+      const day = normalizeDayKey(dayKey);
+      return (governorSpend.get(governorKey(season, day)) || 0n).toString();
+    },
+
+    /**
+     * ADDS `amount` to the day's committed budget and returns the new running
+     * total for that day.
+     *
+     * ACCUMULATES, NEVER REPLACES. A day's emission is many rewards, and the
+     * budget is measured against the sum of all of them; a second write for the
+     * same (season, day) must be unable to erase the first. In the SQLite
+     * adapter that is structural — the primary key plus an `ON CONFLICT DO
+     * UPDATE` that writes the WHOLE new total, never a SQL `+=` (which on a
+     * TEXT column would be SQLite's floating-point addition, i.e. exactly the
+     * rounding this column exists to prevent).
+     *
+     * THERE IS NO `resetGovernorDay`, AND ITS ABSENCE IS THE DESIGN. The caller
+     * derives `dayKey` from the WIB clock, so a new business day is a new
+     * bucket that starts at zero by construction — there is nothing to clear.
+     * A reset method would be worse than useless: it would let a day that has
+     * already emitted be zeroed and re-spent, turning the audit trail of a
+     * season's emission into something any caller can erase. (A genuine
+     * correction — a reward that was committed and then never settled — is a
+     * different operation and belongs to whatever owns settlement, not here.)
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season whose budget is consumed.
+     * @param {string} params.dayKey `YYYY-MM-DD` WIB business day.
+     * @param {number|string|bigint} params.amount 18-decimal CATT base units.
+     * @returns {Promise<string>} The day's new total, as a canonical decimal
+     *   string.
+     * @throws {TypeError} If `amount` is not a non-negative integer, or `dayKey`
+     *   is not a real `YYYY-MM-DD` calendar day.
+     * @throws {Error} If `seasonId` names no season.
+     */
+    async recordGovernorSpend({ seasonId, dayKey, amount } = {}) {
+      const season = knownSeason(seasonId);
+      const day = normalizeDayKey(dayKey);
+      const key = governorKey(season, day);
+      const total = (governorSpend.get(key) || 0n) + toExactAmount(amount, "amount");
+      governorSpend.set(key, total);
+      return total.toString();
+    },
+
+    /**
+     * Everything a season has committed against its daily budgets across EVERY
+     * day, as a canonical decimal string. `"0"` when nothing.
+     *
+     * This is the reconciliation figure: the founder's season allocation is
+     * 3,300,000 CATT, and this is what has actually been committed against it.
+     * It is deliberately NOT `getSeasonClaimedTotal`, and the two are not
+     * expected to agree: a reward the governor scaled down is committed at full
+     * size here and settled at the scaled size there.
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season id.
+     * @returns {Promise<string>} Canonical decimal string; `"0"` when nothing.
+     */
+    async getGovernorSpendTotal({ seasonId } = {}) {
+      const season = knownSeason(seasonId);
+      return governorSeasonTotal(season).toString();
+    },
+
     /**
      * Releases every resource the store holds. A no-op here because there is
      * nothing to release in-process, but it exists so the caller code (server
@@ -1443,6 +1651,37 @@ function createMemoryStore() {
         submissions: submissionOrder.length,
         issuedClaims: issuedClaims.size,
         relayedClaims,
+      };
+    },
+
+    /**
+     * Row counts for every GROWTH/GOVERNOR table, for the parity assertion.
+     *
+     * The memory store keeps each ledger in a `Map`, so "one row" is one entry;
+     * the SQLite adapter counts the same rows with `COUNT(*)`. Comparing these
+     * is what proves the upsert path did not quietly leave a second row behind
+     * for one (season, day) — a duplicate would still total correctly through
+     * the public API if the sum happened to walk it, so the row count is
+     * evidence the totals do NOT have.
+     *
+     * NOT part of `STORAGE_METHODS`: a Postgres adapter has no equivalent and
+     * must not be expected to provide one.
+     *
+     * @returns {{ staminaLedger: number, streaks: number, activeMiners: number,
+     *   freeGrants: number, seasons: number, seasonClaims: number,
+     *   governorSpend: number }}
+     */
+    _debugGrowth() {
+      let minerRows = 0;
+      for (const bucket of activeMiners.values()) minerRows += bucket.size;
+      return {
+        staminaLedger: staminaLedger.size,
+        streaks: streaks.size,
+        activeMiners: minerRows,
+        freeGrants: freeGrants.size,
+        seasons: seasons.size,
+        seasonClaims: seasonClaims.size,
+        governorSpend: governorSpend.size,
       };
     },
   };

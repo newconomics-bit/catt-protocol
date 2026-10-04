@@ -91,7 +91,7 @@
  *     the end: `sessions` → `telemetry` → `submissions` → `nonce_counters` →
  *     `issued_claims` → `stamina_ledger` → `streaks` →
  *     `daily_active_miners` → `free_stamina_grants` → `seasons` →
- *     `season_claims`. The first five have no back-edges; the growth tables
+ *     `season_claims` → `governor_daily_spend`. The first five have no back-edges; the growth tables
  *     depend on nothing but the addresses the caller supplies, so appending them
  *     is safe. Nothing in `issued_claims` is needed to interpret
  *     anything in `submissions`, so the order has no back-edges. Because
@@ -100,7 +100,7 @@
  *     rows the Judge already issued; `citext`/lowercase normalisation on the
  *     application side is what keeps `getIssuedClaim` case-insensitive there.
  *
- *     (e) POSTGRES DDL FOR THE GROWTH LEDGERS (migrations 2 and 3 below)
+ *     (e) POSTGRES DDL FOR THE GROWTH LEDGERS (migrations 2, 3 and 4 below)
  *     Same tables, same constraints, two type widenings and one naming change:
  *
  *       stamina_ledger(               -- per-day stamina SPENT (not a balance)
@@ -164,18 +164,62 @@
  *         PRIMARY KEY (season_id, user_address, nonce)
  *       );
  *       CREATE INDEX season_claims_season ON season_claims (season_id);
+ *       -- season_claims carries NO FOREIGN KEY, deliberately (see below).
+ *
+ *       governor_daily_spend(        -- the DAILY GOVERNOR BUDGET counter
+ *         season_id  text   NOT NULL REFERENCES seasons(id),
+ *         day_key    date   NOT NULL,  -- TEXT 'YYYY-MM-DD': a WIB BUSINESS day
+ *         spent      numeric NOT NULL,  -- TEXT here; see the precision note
+ *         updated_at bigint  NOT NULL,  -- INTEGER ms here
+ *         PRIMARY KEY (season_id, day_key)
+ *       );
+ *       CREATE INDEX governor_daily_spend_day ON governor_daily_spend (day_key);
+ *       -- ONE RUNNING TOTAL PER (season, business day). There is deliberately
+ *       -- no user_address and no nonce here: the row answers "how much of
+ *       -- TODAY's budget is already committed", which is a property of the
+ *       -- bucket and of nothing else. That is also why it is NOT a view over
+ *       -- season_claims — the two are different quantities (see storage.js),
+ *       -- and a settled claim can be smaller than what was committed against
+ *       -- the budget whenever the governor scaled a reward down.
+ *       --
+ *       -- THE FOREIGN KEY IS THE ONE PLACE THE GROWTH TABLES HAVE ONE, and it
+ *       -- is a deliberate difference from `season_claims`. A claim that
+ *       -- outlives its season row is a real historical settlement fact, so
+ *       -- deleting a season must not delete it; a SPEND, by contrast, is a
+ *       -- consumption of a budget that belongs to a season, and a spend row
+ *       -- for a season that does not exist reconciles against nothing and
+ *       -- cannot be scaled or audited. So the FK is kept here (with no
+ *       -- ON DELETE clause: deleting a season is refused rather than silently
+ *       -- erasing how much of its budget was already committed, which is the
+ *       -- one direction this table can fail in that is worth failing).
+ *       -- getGovernorSpendTotal is
+ *       --   SELECT SUM(spent) FROM governor_daily_spend WHERE season_id = $1;
+ *       -- summed in JavaScript as BigInt instead, for the same reason as the
+ *       -- season totals above: SUM() over a TEXT column coerces to a double.
  *
  *     The type widenings, as above: `consumed`/`granted`/`allocation`/`amount`/
- *     `nonce` are TEXT here and `numeric(78,0)` in Postgres — load with
+ *     `nonce`/`spent` are TEXT here and `numeric(78,0)` in Postgres — load with
  *     `::numeric`, NOT `::bigint`; `updated_at`/`claimed_at` are INTEGER
  *     milliseconds here and `bigint` there; `day_key` is a `date` in Postgres
  *     (the TEXT 'YYYY-MM-DD' here is already exactly that literal form, so the
  *     import is a direct cast). Load order for the growth tables is
  *     `stamina_ledger`, `streaks`, `daily_active_miners`,
- *     `free_stamina_grants`, `seasons`, `season_claims` — there are no foreign
- *     keys among them by design: a claim row that outlives its season row is
- *     still a real historical fact, and a foreign key would make season deletion
- *     a data-loss operation.
+ *     `free_stamina_grants`, `seasons`, `season_claims`,
+ *     `governor_daily_spend` — the last one goes LAST because it is the only
+ *     growth table with a foreign key, so its season rows must already be
+ *     present. There are no other foreign keys among the growth tables by
+ *     design: a claim row that outlives its season row is still a real
+ *     historical fact, and a foreign key would make season deletion a data-loss
+ *     operation.
+ *
+ *     GOVERNOR AMOUNTS ARE 1e23-SCALE, NOT 1e18-SCALE. The founder's daily
+ *     budget is 110,000 CATT against a 3,300,000 CATT season allocation, and
+ *     110,000 CATT in 18-decimal base units is 1.1e23 — which is not merely
+ *     imprecise as a JavaScript double (it is far above 2^53) but OUT OF RANGE
+ *     for a signed 64-bit SQLite INTEGER, whose ceiling is 9223372036854775807
+ *     (9.22e18). `spent` is therefore TEXT for the same out-of-range reason
+ *     `issued_claims.reward` is, and the daily budget counter is summed as
+ *     BigInt in JavaScript rather than with SQL `SUM()`.
  *
  *     (d) NO MIGRATION FROM THE IN-MEMORY STORE IS POSSIBLE OR NEEDED
  *     The in-memory store is volatile by definition: it holds everything in two
@@ -204,7 +248,7 @@ const { STORAGE_METHODS, assertStoreShape, normalizeDayKey, isNextDayAfter } = r
  *
  * @type {number}
  */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /**
  * The default database path used when `CATT_STORE=sqlite` and `SQLITE_PATH` is
@@ -516,6 +560,71 @@ const MIGRATIONS = Object.freeze([
       `);
     },
   },
+  {
+    version: 4,
+    /**
+     * The DAILY GOVERNOR BUDGET ledger: one row per (season, business day).
+     *
+     * Pure ADDITIVE DDL — one new table and one new index, nothing added to or
+     * changed on any existing table — and every statement is `IF NOT EXISTS`, so
+     * re-running the whole migration list is a no-op. Migration 3's tables are
+     * untouched, which is what makes a v3 file upgrade in place with its data
+     * intact rather than being rewritten.
+     *
+     * THE PRIMARY KEY IS THE CONSTRAINT, NOT A CONVENTION: one row per
+     * (season, day), so a duplicate insert is refused by SQLite itself and the
+     * upsert path can never leave a second row behind for one day. The test
+     * suite proves that with raw SQL, bypassing this adapter entirely.
+     *
+     * NOT A VIEW OVER `season_claims`. The two are DIFFERENT QUANTITIES and are
+     * never derived from one another (see the note in `storage.js`): this table
+     * is the running emission budget consumed per day, keyed by day and with no
+     * user and no nonce, while `season_claims` is the immutable per-user
+     * settlement record with an idempotency nonce. A reward the governor scaled
+     * down is committed here at full size and settles there at the scaled size,
+     * so the two are not expected to agree for the same event.
+     *
+     * `day_key` is the caller-supplied WIB BUSINESS day (04:00 WIB / 21:00 UTC
+     * rollover, `reset-schedule.js`), stored verbatim as TEXT. The store never
+     * derives it from a timestamp: a new day is a new bucket that starts at zero
+     * by construction, which is why there is no reset method and no "expire
+     * yesterday" step anywhere.
+     *
+     * `spent` is TEXT, not INTEGER: a daily budget is 110,000 CATT = 1.1e23
+     * base units, which is OUT OF RANGE for a signed 64-bit SQLite INTEGER
+     * (ceiling 9223372036854775807) rather than merely imprecise, and a daily
+     * budget that rounds can overshoot the ceiling it exists to enforce.
+     *
+     * THE FOREIGN KEY IS DELIBERATE AND IS THE ONLY ONE AMONG THE GROWTH
+     * TABLES. A spend row for a season that does not exist reconciles against
+     * nothing and cannot be scaled or audited, so it is refused by the DATABASE
+     * rather than by a JavaScript check — and the memory store enforces the same
+     * rule in application code, because the two adapters must agree about
+     * whether an unknown season is writable. There is no `ON DELETE` clause on
+     * purpose: deleting a season is refused rather than silently erasing how
+     * much of its budget was already committed.
+     *
+     * @param {Object} db An open `better-sqlite3` database.
+     * @returns {void}
+     */
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS governor_daily_spend (
+          season_id  TEXT NOT NULL REFERENCES seasons(id),
+          day_key    TEXT NOT NULL,
+          spent      TEXT NOT NULL,
+          updated_at INTEGER NOT NULL,
+          -- NOT NULL is spelled out on the TEXT key because of a SQLite quirk:
+          -- a TEXT PRIMARY KEY does NOT imply NOT NULL (only an INTEGER PRIMARY
+          -- KEY does), and a NULL day would collapse every day's spend for that
+          -- season into one unreadable bucket.
+          PRIMARY KEY (season_id, day_key)
+        );
+        CREATE INDEX IF NOT EXISTS governor_daily_spend_day
+          ON governor_daily_spend (day_key);
+      `);
+    },
+  },
 ]);
 
 /* ------------------------------------------------------------------------ *
@@ -540,15 +649,17 @@ const MIGRATIONS = Object.freeze([
  *   today but are uint256 in the signed struct, so they get the same treatment
  *   rather than a special case that a future change would have to remember.
  *
- *   THE GROWTH LEDGERS FOLLOW THE SAME RULE WHERE IT COSTS NOTHING:
- *   `consumed`, `granted`, `allocation`, `amount` and the season-claim `nonce`
- *   are all TEXT, all returned as canonical decimal strings, for the same
- *   out-of-range reason — a season allocation is 18-decimal CATT and a running
- *   total that rounds is a total that can exceed the very allocation it is meant
- *   to be bounded by. Stamina POINTS themselves are single-digit integers (see
- *   the unit note in `content.js`), but the ledger that SUMS them is stored as
- *   text anyway: a counter that silently rounds above 2^53 is a counter that
- *   lies, and the cost of being exact is one `toDecimalText` call.
+*   THE GROWTH LEDGERS FOLLOW THE SAME RULE WHERE IT COSTS NOTHING:
+*   `consumed`, `granted`, `allocation`, `amount`, the season-claim `nonce` and
+*   the governor's `spent` are all TEXT, all returned as canonical decimal
+*   strings, for the same out-of-range reason — a season allocation is
+*   18-decimal CATT and a running total that rounds is a total that can exceed
+*   the very allocation it is meant to be bounded by. (The governor's daily
+*   budget is 1e23 base units, i.e. it is out of INTEGER range outright rather
+*   than merely inexact.) Stamina POINTS themselves are single-digit integers
+*   (see the unit note in `content.js`), but the ledger that SUMS them is
+*   stored as text anyway: a counter that silently rounds above 2^53 is a
+*   counter that lies, and the cost of being exact is one `toDecimalText` call.
  *
  * WHY ADDRESSES ARE LOWERCASE:
  *   One form, always. `storage.js` already made issued-claim LOOKUPS
@@ -920,6 +1031,35 @@ function createSqliteStore({ filename, logger, createDirectory } = {}) {
     selectUserClaimAmounts: db.prepare(
       "SELECT amount FROM season_claims WHERE season_id = ? AND user_address = ?"
     ),
+
+    /* --- the governor ledger (migration 4) ------------------------------ */
+
+    // One row per (season, business day): the amount committed against TODAY's
+    // daily emission budget. Primary-key lookup, so it is a single index seek
+    // with no clock read and no table scan.
+    selectGovernorSpend: db.prepare(
+      "SELECT spent FROM governor_daily_spend WHERE season_id = ? AND day_key = ?"
+    ),
+    // The `ON CONFLICT` clause writes the WHOLE new total rather than doing a
+    // SQL `+=`: `+=` on a TEXT column would be SQLite's floating-point addition,
+    // which is exactly the rounding the TEXT column exists to prevent.
+    upsertGovernorSpend: db.prepare(
+      `INSERT INTO governor_daily_spend (season_id, day_key, spent, updated_at)
+         VALUES (@seasonId, @dayKey, @spent, @updatedAt)
+       ON CONFLICT (season_id, day_key) DO UPDATE SET spent = excluded.spent, updated_at = excluded.updated_at`
+    ),
+    // The season total, like every other total here, is SUMMED IN JAVASCRIPT as
+    // BigInt: SQLite's SUM() coerces a TEXT column to a double. Served by the
+    // (season_id, day_key) primary key.
+    selectGovernorSpendAmounts: db.prepare(
+      "SELECT spent FROM governor_daily_spend WHERE season_id = ?"
+    ),
+    // The governor reads ask whether the season EXISTS before answering, so an
+    // unknown season is a refusal in BOTH adapters instead of a silent "nothing
+    // spent" here and an error in the memory store. On the WRITE path the
+    // FOREIGN KEY does this job in the database; this statement is what makes
+    // the READ path agree with it.
+    selectSeasonExists: db.prepare("SELECT id FROM seasons WHERE id = ?"),
   };
 
   /* --- row -> view mappers --------------------------------------------- */
@@ -1038,6 +1178,52 @@ function createSqliteStore({ filename, logger, createDirectory } = {}) {
     let total = 0n;
     for (const row of stmt.selectUserClaimAmounts.all(seasonId, userAddress)) {
       total += BigInt(row.amount);
+    }
+    return total;
+  }
+
+  /**
+   * Canonical season id for a governor call, refusing one that names no season.
+   *
+   * The WRITE path is guarded twice: this check gives a readable message, and the
+   * FOREIGN KEY to `seasons(id)` is the guarantee that survives a bug in
+   * application code (a raw INSERT bypassing every line of this module still
+   * fails — the test suite proves it). The memory store enforces the same rule in
+   * application code, because the two adapters must agree about whether an
+   * unknown season is writable or readable.
+   *
+   * @param {*} seasonId Candidate season id.
+   * @returns {string} The canonical season id.
+   * @throws {Error} If no such season has been saved.
+   */
+  function requireSeason(seasonId) {
+    const season = String(seasonId);
+    if (!stmt.selectSeasonExists.get(season)) {
+      throw new Error(
+        `sqlite-store: governor spend references unknown season ${JSON.stringify(season)}. ` +
+          "A daily emission budget belongs to a season row that exists."
+      );
+    }
+    return season;
+  }
+
+  /**
+   * A season's committed governor spend across every day, exactly.
+   *
+   * NOT the same number as `seasonTotal()` above, and the difference is the
+   * point: `seasonTotal` is what was SETTLED to users (per-user, per-nonce
+   * rows), this is what was COMMITTED against the daily budget (per-day rows,
+   * no user). A reward the governor scaled down is committed at full size and
+   * settles at the scaled size, so the two differ by exactly what the governor
+   * held back. Neither is derived from the other.
+   *
+   * @param {string} seasonId Season id.
+   * @returns {bigint}
+   */
+  function governorTotal(seasonId) {
+    let total = 0n;
+    for (const row of stmt.selectGovernorSpendAmounts.all(seasonId)) {
+      total += BigInt(row.spent);
     }
     return total;
   }
@@ -1750,6 +1936,112 @@ function createSqliteStore({ filename, logger, createDirectory } = {}) {
       return Number(stmt.countActiveMiners.get(normalizeDayKey(dayKey)).total);
     },
 
+    /* ------------------------------------------------------------------ *
+     * The GOVERNOR LEDGER (migration 4): one running total per           *
+     * (season, business day). NOT the season claimed total.               *
+     * ------------------------------------------------------------------ */
+
+    /**
+     * How much of TODAY's season emission budget is already committed, as a
+     * canonical decimal string. `"0"` when nothing has been committed.
+     *
+     * The number the reward path scales a reward DOWN by. It is read from the
+     * governor ledger rather than derived from `season_claims` because those are
+     * different quantities: `season_claims` records what was SETTLED to a
+     * specific wallet (per user, per nonce, idempotent), while this records what
+     * was COMMITTED against the day's budget (per day, no user). The full
+     * argument is in `storage.js`.
+     *
+     * `dayKey` is the caller-supplied WIB BUSINESS day (04:00 WIB / 21:00 UTC,
+     * `reset-schedule.js`) and is stored verbatim. The store never derives it
+     * from a timestamp and never expires it, which is why a brand-new day reads
+     * `"0"` with no reset step and why yesterday's spend cannot be mistaken for
+     * today's.
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season whose budget is being measured.
+     * @param {string} params.dayKey `YYYY-MM-DD` WIB business day.
+     * @returns {Promise<string>} Canonical decimal string; `"0"` when nothing.
+     * @throws {TypeError} If `dayKey` is not a real `YYYY-MM-DD` calendar day.
+     * @throws {Error} If `seasonId` names no season.
+     */
+    async getGovernorSpend({ seasonId, dayKey } = {}) {
+      const season = requireSeason(seasonId);
+      const day = normalizeDayKey(dayKey);
+      const row = stmt.selectGovernorSpend.get(season, day);
+      return row ? row.spent : "0";
+    },
+
+    /**
+     * ADDS `amount` to the day's committed budget and returns the new running
+     * total for that day.
+     *
+     * The read, the add and the upsert share ONE transaction, so two concurrent
+     * writes for the same (season, day) cannot both read the same total and one
+     * of them lose its delta; the `ON CONFLICT DO UPDATE` then writes the whole
+     * new total, so a duplicate (season, day) can never produce a second row.
+     *
+     * NO RESET METHOD EXISTS, AND THAT IS THE DESIGN. The caller derives
+     * `dayKey` from the WIB clock, so a new business day is a new bucket that
+     * starts at zero by construction — there is nothing to clear. A reset would
+     * be worse than useless: it would let a day that already emitted be zeroed
+     * and re-spent, so the audit trail of a season's emission could be erased by
+     * any caller. The full argument is in `storage.js`.
+     *
+     * A `seasonId` THAT NAMES NO SEASON IS REFUSED BY THE DATABASE, not by a
+     * check here: the FOREIGN KEY to `seasons(id)` is what makes the refusal
+     * survive a bug in application code. The memory store enforces the same rule
+     * in application code, because the two adapters must agree about whether an
+     * unknown season is writable.
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season whose budget is consumed.
+     * @param {string} params.dayKey `YYYY-MM-DD` WIB business day.
+     * @param {number|string|bigint} params.amount 18-decimal CATT base units.
+     * @returns {Promise<string>} The day's new total, as a canonical decimal
+     *   string.
+     * @throws {TypeError} On a malformed `amount` or `dayKey`.
+     * @throws {Error} If `seasonId` names no season — `FOREIGN KEY constraint
+     *   failed`.
+     */
+    async recordGovernorSpend({ seasonId, dayKey, amount } = {}) {
+      const season = requireSeason(seasonId);
+      const day = normalizeDayKey(dayKey);
+      const spent = exactAmount(amount, "amount");
+      const total = db.transaction(() => {
+        const existing = stmt.selectGovernorSpend.get(season, day);
+        const next = (existing ? BigInt(existing.spent) : 0n) + spent;
+        stmt.upsertGovernorSpend.run({
+          seasonId: season,
+          dayKey: day,
+          spent: next.toString(),
+          updatedAt: Date.now(),
+        });
+        return next;
+      })();
+      return total.toString();
+    },
+
+    /**
+     * Everything a season has committed against its daily budgets across EVERY
+     * day, as a canonical decimal string. `"0"` when nothing.
+     *
+     * THE RECONCILIATION FIGURE, and explicitly not
+     * `getSeasonClaimedTotal()`: the founder's allocation is 3,300,000 CATT and
+     * this is what was committed against it, whereas the claimed total is what
+     * was actually settled. A reward the governor scaled down is committed at
+     * full size here and settles at the scaled size there, so the two are not
+     * expected to agree. Summed as BigInt in JavaScript, never with SQL `SUM()`,
+     * which would coerce this TEXT column to a double.
+     *
+     * @param {Object} params
+     * @param {string} params.seasonId Season id.
+     * @returns {Promise<string>} Canonical decimal string; `"0"` when nothing.
+     */
+    async getGovernorSpendTotal({ seasonId } = {}) {
+      return governorTotal(requireSeason(seasonId)).toString();
+    },
+
     /**
      * Closes the database. Safe to call twice, and safe to call when the store
      * was never opened successfully. The final call also checkpoints the WAL, so
@@ -1798,6 +2090,32 @@ function createSqliteStore({ filename, logger, createDirectory } = {}) {
         submissions: one("SELECT COUNT(*) AS n FROM submissions"),
         issuedClaims: one("SELECT COUNT(*) AS n FROM issued_claims"),
         relayedClaims: one("SELECT COUNT(*) AS n FROM issued_claims WHERE relayed_tx_hash IS NOT NULL"),
+      };
+    },
+
+    /**
+     * Row counts for every GROWTH/GOVERNOR table — the SQLite half of the memory
+     * store's `_debugGrowth()`, so the parity assertion can compare the two with
+     * one `deepEqual`. Counting the tables (rather than trusting the public
+     * totals) is what proves the upsert path left exactly one row per
+     * (season, day) instead of quietly inserting a second.
+     *
+     * NOT part of `STORAGE_METHODS`.
+     *
+     * @returns {{ staminaLedger: number, streaks: number, activeMiners: number,
+     *   freeGrants: number, seasons: number, seasonClaims: number,
+     *   governorSpend: number }}
+     */
+    _debugGrowth() {
+      const one = (sql) => Number(db.prepare(sql).get().n);
+      return {
+        staminaLedger: one("SELECT COUNT(*) AS n FROM stamina_ledger"),
+        streaks: one("SELECT COUNT(*) AS n FROM streaks"),
+        activeMiners: one("SELECT COUNT(*) AS n FROM daily_active_miners"),
+        freeGrants: one("SELECT COUNT(*) AS n FROM free_stamina_grants"),
+        seasons: one("SELECT COUNT(*) AS n FROM seasons"),
+        seasonClaims: one("SELECT COUNT(*) AS n FROM season_claims"),
+        governorSpend: one("SELECT COUNT(*) AS n FROM governor_daily_spend"),
       };
     },
 
