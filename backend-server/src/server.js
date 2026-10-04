@@ -29,12 +29,26 @@
  *                                          users rather than just this one.
  *   5. Evaluate the submission.         -> comprehension.
  *   6. AND the three verdicts together.  -> a pass requires all three.
- *   7. On FAIL: store it, sign nothing. -> no nonce is burned, no signature is
+ *   7. THE LIVE ECONOMY, on a PASS only: free stamina -> dynamic emission and
+ *      streak pricing -> daily stamina cap -> season hard cap. -> see the block
+ *      in the handler; two invariants matter beyond the arithmetic: the STREAK
+ *      IS READ BEFORE THE COMPLETION IS RECORDED (step 10) or the Judge would
+ *      pay tomorrow's streak for today's completion, and the season cap is
+ *      checked BEFORE the nonce is reserved (step 11) so an exhausted season
+ *      burns nothing at all.
+ *   8. On FAIL: store it, sign nothing. -> no nonce is burned, no signature is
  *                                          produced, and the response contains
  *                                          no `claim` and no `signature` key at
  *                                          all, so there is nothing to replay
  *                                          even if the client keeps the body.
- *   8. On PASS: reserve a nonce, THEN sign, THEN record what was signed.
+ *   9. On PASS: reserve a nonce, settle it against the season pool, THEN sign,
+ *      THEN record what was signed.
+ *
+ * WHAT IS ADDITIVE AND WHAT IS NOT: steps 1-6 and the FAIL shape are exactly as
+ * they were. Everything the economy does is bounded by "only on a PASS, only
+ * before the nonce, only from injected dependencies", so an unreachable
+ * mechanism cannot start writing to a user's ledgers and a FAIL cannot mint,
+ * sign or accrue anything.
  *
  * Steps 3-5 are all "read-only" and are evaluated before ANY state is written,
  * because a submission that is going to fail must not consume a nonce (see
@@ -66,6 +80,9 @@ const { ethers } = require("ethers");
 const content = require("./content");
 const anticheat = require("./anticheat");
 const signer = require("../signer");
+const economics = require("./economics");
+const seasons = require("./seasons");
+const staminaAllowance = require("./stamina-allowance");
 const { createMemoryStore, assertStoreShape, STORAGE_ADAPTERS, getStorageAdapter } = require("./storage");
 const relayModule = require("./relay");
 
@@ -122,7 +139,54 @@ const ERRORS = Object.freeze({
   RELAY_ALREADY_RELAYED: "RELAY_ALREADY_RELAYED",
   RELAY_TX_REVERTED: "RELAY_TX_REVERTED",
   RELAY_TX_FAILED: "RELAY_TX_FAILED",
+  /* --- the live economy (see /api/submit step 7) --- */
+  /**
+   * The season's 2,000,000 CATT pool is spent, so the claim cannot settle.
+   * Deliberately LOUD and deliberately the season module's own code: the
+   * founder's rule is that an exhausted season STOPS mining, and a client (or
+   * an operator reading a log) has to be able to tell that apart from every
+   * other refusal without a second lookup table.
+   */
+  SEASON_ALLOCATION_EXHAUSTED: seasons.SEASON_ERRORS.ALLOCATION_EXHAUSTED,
+  /** No season owns this instant: before the epoch, or the schedule is unwritten. No fallback. */
+  SEASON_NO_ACTIVE_SEASON: seasons.SEASON_ERRORS.NO_ACTIVE_SEASON,
+  /** The season that owns this instant has already closed. Its accruals survive; a new claim does not. */
+  SEASON_WINDOW_ENDED: seasons.SEASON_ERRORS.WINDOW_ENDED,
+  /** The stored season settles under a claim mode this build does not support. */
+  SEASON_UNKNOWN_CLAIM_MODE: seasons.SEASON_ERRORS.UNKNOWN_CLAIM_MODE,
+  /** This (season, user, nonce) has already been recorded — a replayed settlement. */
+  SEASON_CLAIM_ALREADY_RECORDED: seasons.SEASON_ERRORS.CLAIM_ALREADY_RECORDED,
+  /** Today's stamina SPEND cap (50 points by default) is already committed. */
+  DAILY_STAMINA_CAP_EXCEEDED: "DAILY_STAMINA_CAP_EXCEEDED",
 });
+
+/**
+ * HTTP status for each season refusal, so a season failure is a clear, stable
+ * client-visible code rather than an opaque 500.
+ *
+ * 409 for all of them, and that is the point: a 500 would say "the Judge is
+ * broken" when the system is behaving EXACTLY as specified — a season whose
+ * pool is spent is a correct, intended, observable outage whose recovery is the
+ * next season. `INVALID_ARGUMENT` and `INVARIANT_VIOLATED` are deliberately
+ * absent: those are OUR bugs and must surface as a 500.
+ */
+const SEASON_ERROR_HTTP_STATUS = Object.freeze({
+  [seasons.SEASON_ERRORS.ALLOCATION_EXHAUSTED]: 409,
+  [seasons.SEASON_ERRORS.NO_ACTIVE_SEASON]: 409,
+  [seasons.SEASON_ERRORS.WINDOW_ENDED]: 409,
+  [seasons.SEASON_ERRORS.UNKNOWN_CLAIM_MODE]: 409,
+  [seasons.SEASON_ERRORS.CLAIM_ALREADY_RECORDED]: 409,
+});
+
+/**
+ * The nonce used for the season DRY RUN that runs before a real nonce exists.
+ *
+ * `previewSettlement` writes nothing, so this key is never reserved, never
+ * recorded and never spent; it exists only so the hard-cap refusal happens
+ * before the one irreversible step in the handler. `0` is not a nonce the
+ * store will ever hand out (`reserveNonce` counts from 1).
+ */
+const SEASON_PREVIEW_NONCE = "0";
 
 /**
  * Extra flags the JUDGE adds on top of the anti-cheat engine's own flags.
@@ -191,6 +255,188 @@ function toUintString(value) {
   if (typeof value === "string" && /^\d+$/.test(value.trim())) return BigInt(value.trim()).toString();
   if (typeof value === "string" && /^-?\d+$/.test(value.trim())) return BigInt(value.trim()).toString();
   return "0";
+}
+
+/**
+ * The UTC day immediately BEFORE `dayKey`, as `YYYY-MM-DD`.
+ *
+ * UTC arithmetic on the parsed calendar parts, so month, year and leap
+ * boundaries are ordinary cases rather than special ones. `null` for anything
+ * that is not a real `YYYY-MM-DD` day key, which the caller treats as "no
+ * consecutive day" — the safe direction, since an unreadable day key must not
+ * be able to buy a streak multiplier.
+ *
+ * @param {*} dayKey Candidate day key.
+ * @returns {string|null}
+ */
+function previousDayKey(dayKey) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayKey));
+  if (!match) return null;
+  const asUtc = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])) - 86_400_000;
+  if (!Number.isFinite(asUtc)) return null;
+  return new Date(asUtc).toISOString().slice(0, 10);
+}
+
+/**
+ * The CONSECUTIVE, already-banked streak days a claim is entitled to be paid on.
+ *
+ * WHY THE JUDGE HAS TO DERIVE THIS rather than reading `store.getStreak(...).current`
+ * straight into the pricing call. The store deliberately applies the gap rule at
+ * WRITE time — `recordGradedCompletion` resets the row to 1 on any day that is not
+ * the next calendar day, and its own documentation is explicit that the store only
+ * counts and the economic policy decides what counting is worth. The row therefore
+ * means "N consecutive graded days, ending on `lastGradedDay`", NOT "N days before
+ * today", and the two differ in exactly two situations:
+ *
+ *   - THE FIRST CLAIM AFTER A MISSED DAY. The row still holds the pre-gap count,
+ *     because the reset for that gap is this very claim's job to write. Read raw,
+ *     a deliberate day off per streak would cost nothing and the ladder would
+ *     never actually reset.
+ *   - A SECOND MISSION ON THE SAME DAY. The row counts TODAY among its N days.
+ *     Read raw, the day's second mission would be paid on N banked days while its
+ *     own first mission was paid on N - 1, so a user could raise their own payout
+ *     simply by mining again later the same day. Off by one here is a free,
+ *     repeatable escalation, so it is corrected too.
+ *
+ * @param {Object} streak `store.getStreak(...)` for the claiming user.
+ * @param {string} dayKey The UTC day this claim is graded for.
+ * @returns {number} Banked consecutive days BEFORE today: 0 when the chain is
+ *   broken or absent.
+ */
+function consecutiveStreakDays(streak, dayKey) {
+  if (!streak || typeof streak !== "object") return 0;
+  const banked = Number(streak.current);
+  if (!Number.isFinite(banked) || banked <= 0) return 0;
+  const last = streak.lastGradedDay;
+  if (last === null || last === undefined) return 0;
+  if (last === dayKey) return banked - 1 > 0 ? banked - 1 : 0;
+  return last === previousDayKey(dayKey) ? banked : 0;
+}
+
+/**
+ * ============================================================================
+ * THE CONFIG SURFACE, AND THE PARSE RULE THAT IS DELIBERATELY INVERTED
+ * ============================================================================
+ * Every economic mechanism below is ON by default, and its flag is read with
+ * the rule stated here. IT IS INVERTED RELATIVE TO THE USUAL "SAFE DEFAULTS"
+ * CONVENTION AND THAT IS THE FOUNDER'S CHOICE, NOT AN OVERSIGHT:
+ *
+ *     ONLY AN EXPLICIT LITERAL `false`, `0` OR `off` DISABLES A MECHANISM.
+ *
+ * Unset, empty, whitespace, a typo, `yes`, `1`, `true`, `enabled` — ALL of them
+ * leave the AGGRESSIVE behaviour ON. A misspelled `CATT_DYNAMIC_EMISSIOM=false`
+ * does not silently restore flat rewards; it leaves dynamic emission running,
+ * which is the loud, observable, founder-chosen state rather than a quiet
+ * reversion to an economics policy nobody chose.
+ *
+ * DO NOT "FIX" THIS BACK to a conventional parse that defaults to off or that
+ * treats any falsy string as off. That reversion is precisely the failure mode
+ * this comment exists to prevent.
+ */
+const DISABLING_FLAG_LITERALS = Object.freeze(["false", "0", "off"]);
+
+/**
+ * Reads one on/off mechanism flag under the INVERTED rule above.
+ *
+ * @param {*} raw The raw environment value; `undefined`/`null` means unset.
+ * @param {boolean} [fallback] The value when the flag says nothing usable.
+ * @returns {boolean}
+ */
+function flagEnabled(raw, fallback = true) {
+  if (raw === undefined || raw === null) return fallback;
+  const text = String(raw).trim().toLowerCase();
+  if (text === "") return fallback;
+  return !DISABLING_FLAG_LITERALS.includes(text);
+}
+
+/**
+ * Reads one numeric flag under the same inverted rule: anything that is not a
+ * usable finite number leaves the FOUNDER-CHOSEN DEFAULT in place, because
+ * garbage must not become a different economic parameter.
+ *
+ * @param {*} raw The raw environment value.
+ * @param {number|null} [fallback] The default, or `null` for "no default".
+ * @returns {number|null}
+ */
+function flagNumber(raw, fallback) {
+  if (raw === undefined || raw === null) return fallback;
+  const text = String(raw).trim();
+  if (text === "") return fallback;
+  const parsed = Number(text);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/**
+ * Builds the live economy configuration for one app instance.
+ *
+ * Pure with respect to the store and the chain: it reads the environment (or
+ * the injected `env`), reads the injected clock ONCE for the boot instant, and
+ * returns a frozen decision. No I/O, so `createApp` stays synchronous.
+ *
+ * @param {Object} params
+ * @param {Object} params.env Environment to read.
+ * @param {Function} params.clock `() => epoch milliseconds`.
+ * @param {number|null} [params.dailyStaminaCap] Injected cap override.
+ * @returns {Readonly<Object>} The frozen economy configuration.
+ */
+function readEconomyConfig({ env, clock, dailyStaminaCap } = {}) {
+  const source = env || process.env;
+  const bootMs = clock();
+  const bootSeconds = Math.floor(bootMs / 1000);
+
+  // `SEASON_EPOCH` IS THE FOUNDER-UNSPECIFIED PARAMETER, AND 0 IS ITS DOCUMENTED
+  // DEFAULT. It is NOT what the wired Judge uses when the flag is unset, and the
+  // reason is mechanical rather than editorial: the schedule is twenty CONTIGUOUS
+  // 30-day windows starting at the epoch, so an epoch of 0 puts every window
+  // inside 1970 and every instant from 1971 onwards has NO active season — with
+  // the documented, no-fallback `SEASON_NO_ACTIVE_SEASON` refusal, an epoch of 0
+  // would mean the Judge signs nothing, ever. The wired default is therefore the
+  // BOOT INSTANT (season 1 starts when the Judge first boots), and the
+  // founder's 0 is fully live and reachable: set `CATT_SEASON_EPOCH=0` and the
+  // 1970 schedule is written verbatim and every claim refuses loudly.
+  const configuredEpoch = flagNumber(source.CATT_SEASON_EPOCH, null);
+  const seasonEpoch = configuredEpoch === null ? bootSeconds : Math.trunc(configuredEpoch);
+
+  const cap = dailyStaminaCap === undefined || dailyStaminaCap === null
+    ? flagNumber(source.CATT_DAILY_STAMINA_CAP, content.DEFAULT_DAILY_STAMINA_CAP)
+    : dailyStaminaCap;
+
+  return Object.freeze({
+    /** The twenty-season schedule is enforced: per-claim `settle`, hard cap. */
+    seasons: flagEnabled(source.CATT_SEASONS),
+    /** Launch instant the twenty windows are generated from. */
+    seasonEpoch,
+    /** Rewards shrink with the active-miner count. */
+    dynamicEmission: flagEnabled(source.CATT_DYNAMIC_EMISSION),
+    /** Top of the dynamic-emission ramp (the founder did not specify it). */
+    floorMiners: flagNumber(source.CATT_DYNAMIC_EMISSION_FLOOR_MINERS, Number(economics.DYNAMIC_EMISSION_FLOOR_MINERS)),
+    /** Rewards grow with consecutive graded days. */
+    streakMultiplier: flagEnabled(source.CATT_STREAK_MULTIPLIER),
+    /** 30 free stamina points per user per UTC day, off-chain ledger only. */
+    freeStamina: flagEnabled(source.CATT_FREE_STAMINA),
+    /** The daily stamina SPEND ceiling, in unitless points. */
+    dailyStaminaCap: cap,
+    /** The pure admission policy for that ceiling. */
+    staminaPolicy: content.createStaminaPolicy({ cap: cap === null ? null : Math.trunc(cap) }),
+  });
+}
+
+/**
+ * Maps a `seasons.js` refusal onto an HTTP status + stable Judge error code.
+ *
+ * @param {*} err The thrown error.
+ * @returns {{ status: number, code: string }|null} The refusal, or `null` when
+ *   the error is OURS (`SEASON_INVALID_ARGUMENT`, `SEASON_INVARIANT_VIOLATED`,
+ *   a store fault) and must stay an opaque 500 rather than be blamed on the
+ *   client.
+ */
+function seasonRefusal(err) {
+  if (!err || typeof err.code !== "string") return null;
+  const status = SEASON_ERROR_HTTP_STATUS[err.code];
+  if (status === undefined) return null;
+  const code = ERRORS[err.code];
+  if (typeof code !== "string") return null;
+  return { status, code };
 }
 
 /**
@@ -350,10 +596,30 @@ async function relayExpectedSigner(relay, override) {
  * @param {string} [params.expectedSigner] Override for the address whose
  *   signatures the claimer accepts. Used by tests and by offline deployments;
  *   when omitted the value is read from the chain via `MiningClaimer.signer()`.
+ * @param {Function} [params.clock] `() => epoch milliseconds`. The ONE place the
+ *   Judge reads time, injected so the streak ladder, the day rollover, the
+ *   season window and the claim deadline can all be driven deterministically by
+ *   a test. Defaults to `Date.now`; nothing below reads a clock directly.
+ * @param {Object} [params.env] Environment the economy flags are read from.
+ *   Defaults to `process.env`. Only the economy block consults it, and only for
+ *   non-secret configuration.
+ * @param {number|null} [params.dailyStaminaCap] Overrides the daily stamina
+ *   SPEND ceiling (`CATT_DAILY_STAMINA_CAP`); `null` disables the throttle.
  * @returns {import("express").Express} The configured app.
  * @throws {Error} If the injected store does not implement the storage interface.
  */
-function createApp({ store, privateKey, chainId, verifyingContract, logger, relayService, expectedSigner } = {}) {
+function createApp({
+  store,
+  privateKey,
+  chainId,
+  verifyingContract,
+  logger,
+  relayService,
+  expectedSigner,
+  clock,
+  env,
+  dailyStaminaCap,
+} = {}) {
   const activeStore = store || createMemoryStore();
 
   // Fail fast and loudly: a Postgres adapter that forgets a method must not be
@@ -361,6 +627,96 @@ function createApp({ store, privateKey, chainId, verifyingContract, logger, rela
   assertStoreShape(activeStore);
 
   const log = logger || console;
+  const activeClock = typeof clock === "function" ? clock : Date.now;
+  /* The live economy: dynamic emission, streak, seasons, free stamina and the
+   * daily stamina spend cap. Every flag defaults to the founder's aggressive
+   * choice and is only switched off by an explicit false/0/off — see the parse
+   * rule above `flagEnabled`. */
+  const economy = readEconomyConfig({ env, clock: activeClock, dailyStaminaCap });
+
+  /**
+   * Writes the twenty-season schedule into the store, once, on boot.
+   *
+   * IDEMPOTENT, and it never clobbers a stored row that differs (see
+   * `seasons.js`): a differing window or allocation is preserved and reported,
+   * because `saveSeason` is an upsert and silently rewriting it would move a
+   * window that claims have already been recorded against.
+   *
+   * The promise is memoised so twenty concurrent first requests do not each run
+   * the write, and it is primed at boot rather than awaited there (`createApp`
+   * is synchronous). A failure clears the memo so the next request retries
+   * instead of serving claims against an unwritten schedule — which would fail
+   * anyway, with `SEASON_NO_ACTIVE_SEASON`, but with a confusing cause.
+   *
+   * @returns {Promise<Object>} The `ensureSeasons` summary.
+   */
+  function ensureSeasonSchedule() {
+    if (seasonSchedule === null) {
+      seasonSchedule = seasons
+        .ensureSeasons(activeStore, { epoch: economy.seasonEpoch })
+        .catch((err) => {
+          seasonSchedule = null;
+          throw err;
+        });
+      // Primed here so the schedule is written even by a Judge that never sees
+      // a claim. The bare catch is here so a boot-time failure is not an
+      // unhandled rejection; the request path still sees the real error.
+      seasonSchedule.catch(() => {});
+    }
+    return seasonSchedule;
+  }
+
+  /** @type {Promise<Object>|null} See {@link ensureSeasonSchedule}. */
+  let seasonSchedule = null;
+  if (economy.seasons) ensureSeasonSchedule();
+
+  /**
+   * Proves, WITHOUT WRITING ANYTHING, that this claim may settle into the
+   * season pool — and answers the refusal itself when it may not.
+   *
+   * This is the "an exhausted season burns nothing" guarantee. It runs before
+   * `reserveNonce`, so a `SEASON_ALLOCATION_EXHAUSTED` pool costs the user no
+   * nonce, produces no signature and reports no success; the season total does
+   * not move. It goes through `previewSettlement`, which is the dry run of
+   * `settle` through the SAME decision function, so the preview can never say
+   * yes to something the settlement would refuse.
+   *
+   * `SEASON_NO_ACTIVE_SEASON` — an instant before `SEASON_EPOCH`, or a
+   * schedule that does not cover it — is the SAME loud refusal with NO
+   * fallback season. A default season would be an uncapped pool by another
+   * name, which is the one failure mode the season module exists to make
+   * impossible.
+   *
+   * @param {Object} res Express response, used only to send a refusal.
+   * @param {string} userAddress Claiming wallet.
+   * @param {string} amount Exact CATT base-unit reward as a decimal string.
+   * @param {number} nowSeconds The instant, unix seconds.
+   * @returns {Promise<Object|null>} The decision, or `null` when a refusal was
+   *   sent.
+   */
+  async function previewSeasonClaim(res, userAddress, amount, nowSeconds) {
+    try {
+      return await seasons.previewSettlement(activeStore, {
+        userAddress,
+        amount,
+        nonce: SEASON_PREVIEW_NONCE,
+        now: nowSeconds,
+      });
+    } catch (err) {
+      const refusal = seasonRefusal(err);
+      if (refusal === null) throw err;
+      if (log && typeof log.warn === "function") {
+        log.warn("catt-economy: season refused a claim", {
+          code: refusal.code,
+          seasonId: err.seasonId === undefined ? null : String(err.seasonId),
+          remaining: err.remaining === undefined ? null : String(err.remaining),
+        });
+      }
+      sendError(res, refusal.status, refusal.code);
+      return null;
+    }
+  }
+
   const activeRelay =
     relayService ||
     relayModule.createRelayServiceFromEnv({
@@ -672,9 +1028,145 @@ function createApp({ store, privateKey, chainId, verifyingContract, logger, rela
     if (syndicate.syndicate) blockingFlags.push(JUDGE_FLAGS.SYNDICATE_MATCH);
     if (!telemetryOk) blockingFlags.push(JUDGE_FLAGS.TELEMETRY_UNACCEPTABLE);
     const failed = result.status !== anticheat.PASS || syndicate.syndicate || !telemetryOk;
-    const effectiveResult = failed
+    let effectiveResult = failed
       ? { ...resultJson, status: anticheat.FAIL, reward: 0, flags: blockingFlags }
       : { ...resultJson, status: anticheat.PASS };
+
+    /* ================================================================== *
+     * 7. THE LIVE ECONOMY.                                                *
+     * ================================================================== *
+     * Everything below is bounded by THREE rules, each of which exists
+     * because breaking it is a way to mint or to deny for free:
+     *
+     *   (i)   ONLY ON A PASS. A rejected submission prices nothing, accrues
+     *         nothing and consumes no season allocation. The one exception is
+     *         the free-stamina grant, which is day-scoped ACCESS and not a
+     *         reward (see below).
+     *   (ii)  THE STREAK IS READ BEFORE THE COMPLETION IS RECORDED. The
+     *         record happens at step 10, below, and only on a PASS — the
+     *         documented risk in `economics.js`: recording first would pay
+     *         tomorrow's day count for today's completion, and two missions
+     *         in one UTC day would farm a bonus day.
+     *   (iii) THE SEASON HARD CAP IS CHECKED BEFORE THE NONCE IS RESERVED,
+     *         so an exhausted season burns NOTHING: no nonce, no signature,
+     *         no claim, no success. It is a dry run through the SAME decision
+     *         function `settle` uses, so the two cannot disagree.
+     *
+     * A REFUSAL HERE (cap exceeded, season exhausted) is answered BEFORE the
+     * submission row is written. That is deliberate: a stored row carrying a
+     * priced reward that was never signed is a number a later reader could
+     * mistake for a payable, and the refusal is already loud and typed — so
+     * nothing about it is silent, and nothing accrues.
+     */
+    const nowMs = activeClock();
+    const nowSeconds = Math.floor(nowMs / 1000);
+    const dayKey = content.dayKeyFor(nowMs);
+
+    /* --- 7a. DAY ROLLOVER: the free-stamina allowance. --- *
+     * 30 points per user per UTC day, ONCE per dayKey, in an off-chain
+     * ledger. `grantFreeStamina` is idempotent by arithmetic rather than by a
+     * flag, so calling it on every submit IS the rollover detection: the first
+     * call of the day writes the remainder, later calls of the same day write
+     * nothing at all.
+     *
+     * IT DOES NOT BYPASS THE ON-CHAIN `consumeStamina`. This records what the
+     * user is OWED; the claim still has to settle against `StakingManager`
+     * or it reverts there. Nothing here mints, balances or weakens a check.
+     *
+     * IT IS GRANTED FOR A GRADED ATTEMPT, NOT ONLY A PASSED ONE, because it
+     * buys access to the day's first missions rather than paying for one. */
+    const freeStaminaGrant = economy.freeStamina
+      ? await staminaAllowance.grantFreeStamina(activeStore, { userAddress: user, now: dayKey })
+      : null;
+
+    /** The audit block returned on a PASS. Never on a FAIL: nothing was priced. */
+    let economyJson = null;
+
+    if (!failed) {
+      /* --- 7b. The two live factors. READ-ONLY, and before any write. --- */
+      const streak = await activeStore.getStreak({ userAddress: user });
+      const activeMiners = economy.dynamicEmission
+        ? await activeStore.countActiveMiners({ dayKey })
+        : 0;
+      const priced = economics.computeReward({
+        mission,
+        activeMiners,
+        // Rule (ii): this is the streak as it stood BEFORE this completion, and
+        // only its CONSECUTIVE days count — see `consecutiveStreakDays`, which is
+        // what makes a missed day reset the ladder to 1.0x instead of paying the
+        // pre-gap count one last time.
+        streakDays: economy.streakMultiplier ? consecutiveStreakDays(streak, dayKey) : 0,
+        floorMiners: economy.floorMiners,
+      });
+      // The priced amount REPLACES the mission's flat reward, so the signed
+      // claim, the stored submission row and the response all carry one number.
+      effectiveResult = { ...effectiveResult, reward: priced.reward };
+
+      /* --- 7c. The daily stamina SPEND cap, still 50. --- *
+       * A cap on stamina SPENT per UTC day, re-derived from the per-DAY
+       * ledger, so unspent stamina rolls over and is never confiscated. It is
+       * enforced ALONGSIDE the free grant, which is 30 points AVAILABLE: the
+       * grant buys access to the day's first missions, not a way past the
+       * day's ceiling. A refusal is loud (429) and happens BEFORE the nonce,
+       * so a throttled user has not burned anything. */
+      const consumedBefore = await activeStore.getStaminaConsumed({ userAddress: user, dayKey });
+      const staminaCostPoints = Number(effectiveResult.staminaCost);
+      const admission = economy.staminaPolicy.admits({
+        consumed: Number(consumedBefore.consumed),
+        amount: Number.isSafeInteger(staminaCostPoints) ? staminaCostPoints : 0,
+      });
+      if (!admission.allowed) {
+        return sendError(res, 429, ERRORS.DAILY_STAMINA_CAP_EXCEEDED);
+      }
+
+      /* --- 7d. The season pool is a HARD CAP, checked before the nonce. --- */
+      let seasonDecision = null;
+      if (economy.seasons) {
+        await ensureSeasonSchedule();
+        // A refusal is answered HERE, before the nonce: `null` means the
+        // response has already been sent.
+        seasonDecision = await previewSeasonClaim(res, user, priced.reward, nowSeconds);
+        if (seasonDecision === null) return;
+      }
+
+      economyJson = {
+        dayKey,
+        baseReward: priced.baseReward,
+        reward: priced.reward,
+        dynamicEmission: {
+          enabled: economy.dynamicEmission,
+          activeMiners: priced.breakdown.activeMiners,
+          triggerMiners: priced.breakdown.triggerMiners,
+          floorMiners: priced.breakdown.floorMiners,
+          factorBps: priced.breakdown.dynamicFactorBps,
+          applied: priced.applied.dynamicEmission,
+        },
+        streak: {
+          enabled: economy.streakMultiplier,
+          daysBeforeCompletion: priced.breakdown.streakDays,
+          factorBps: priced.breakdown.streakFactorBps,
+          applied: priced.applied.streakMultiplier,
+        },
+        freeStamina: freeStaminaGrant
+          ? {
+              dayKey: freeStaminaGrant.dayKey,
+              grantedThisCall: freeStaminaGrant.granted,
+              dayTotal: freeStaminaGrant.dayTotal,
+              remaining: freeStaminaGrant.remaining,
+            }
+          : null,
+        staminaSpend: {
+          dayKey,
+          cost: String(admission.amount),
+          capPoints: admission.cap,
+          consumedBefore: consumedBefore.consumed,
+          remainingAfter: admission.remaining === null ? null : String(admission.remaining),
+        },
+        season: seasonDecision
+          ? { enabled: true, seasonId: seasonDecision.seasonId, remainingAfter: seasonDecision.remainingAfter }
+          : { enabled: false, seasonId: null, remainingAfter: null },
+      };
+    }
 
     /* Always store the attempt, pass or fail: the FAIL rows are the corpus
      * syndicate detection reads next, and the audit trail for disputes. */
@@ -692,7 +1184,7 @@ function createApp({ store, privateKey, chainId, verifyingContract, logger, rela
     const syndicateJson = toJsonSafe(syndicate);
     const telemetryJson = { score: telemetry.score, flags: telemetry.flags };
 
-    /* --- 7. FAIL: no nonce, no signature, no `claim` key at all. --- */
+    /* --- 8. FAIL: no nonce, no signature, no `claim` key at all. --- */
     if (failed) {
       return res.status(200).json({
         status: anticheat.FAIL,
@@ -702,12 +1194,56 @@ function createApp({ store, privateKey, chainId, verifyingContract, logger, rela
       });
     }
 
-    /* --- 8. PASS: reserve a nonce, then sign it. --- *
+    /* --- 9. PASS: record the graded completion. ONLY NOW, and only here. --- *
+     * Rule (ii), the other half: the streak was READ at step 7b, and the
+     * record is what ADVANCES it (first ever -> 1, same day -> unchanged,
+     * immediate next UTC day -> +1, any gap or retroactive day -> reset to 1).
+     * A FAIL never reaches this line, so a wrong quiz can neither inflate a
+     * streak nor count its author as an active miner — and the active-miner
+     * count is the input that shrinks everybody ELSE's emission. */
+    await activeStore.recordGradedCompletion({
+      userAddress: user,
+      dayKey,
+      reward: effectiveResult.reward,
+      missionId: mission.id,
+    });
+
+    /* --- 10. PASS: reserve a nonce, settle it, THEN sign. --- *
      * The nonce is reserved BEFORE signing and before responding, because    *
      * the contract burns whatever nonce it sees forever: if the process died *
      * between here and the response, that nonce must already be retired.     */
     const nonce = await activeStore.reserveNonce(user);
-    const deadline = Math.floor(Date.now() / 1000) + CLAIM_TTL_SECONDS;
+    const deadline = nowSeconds + CLAIM_TTL_SECONDS;
+
+    if (economy.seasons) {
+      // The real settlement, carrying the nonce that was just reserved. The
+      // hard cap was already proved at step 7d, so reaching here means this
+      // either records the claim or loses a race against a concurrent one.
+      try {
+        await seasons.settle(activeStore, {
+          userAddress: user,
+          amount: effectiveResult.reward,
+          nonce: String(nonce),
+          now: nowSeconds,
+        });
+      } catch (err) {
+        const refusal = seasonRefusal(err);
+        if (refusal === null) throw err;
+        return sendError(res, refusal.status, refusal.code);
+      }
+    }
+
+    // The day's SPENT ledger moves only for a claim that actually settled, and
+    // it moves once. This mirrors the on-chain `consumeStamina` debit; it
+    // never replaces it.
+    const consumedAfter = await activeStore.recordStaminaConsumption({
+      userAddress: user,
+      dayKey,
+      amount: effectiveResult.staminaCost,
+    });
+    if (economyJson !== null) {
+      economyJson = { ...economyJson, staminaSpend: { ...economyJson.staminaSpend, consumedAfter: consumedAfter.consumed } };
+    }
 
     // The signed claim is built from the SAME normalised values that are
     // returned to the client, so `claim` in the response is byte-for-byte the
@@ -754,6 +1290,9 @@ function createApp({ store, privateKey, chainId, verifyingContract, logger, rela
       // The signer's PUBLIC address. This is the only signer-derived value
       // that ever leaves the process; the key never does.
       signer: signed.signer,
+      // Everything the economy decided for this claim, so a settlement can be
+      // re-derived by hand from the response alone.
+      economy: economyJson,
     });
   }));
 
