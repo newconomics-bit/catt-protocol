@@ -1128,7 +1128,17 @@ describe("ATTACK 3 — telemetry spoofing with a perfect-but-static profile", ()
 /* ========================================================================== */
 
 describe("ATTACK 4 — a five-account syndicate ring", () => {
-  /** The copy-pasted free text every accomplice submits verbatim. */
+  /**
+   * The copy-pasted free text every accomplice submits verbatim.
+   *
+   * Since the corpus fix below, the corpus is "the recent submissions of OTHER
+   * users" (`excludeUserAddress`), not "everybody". Nothing about this ring
+   * changes: it is five DIFFERENT addresses, so every member after the first
+   * still sees the first member's text, and the ring is still caught in full.
+   * The corpus filter removes exactly ONE address from the window, and for a
+   * ring that address is the caller's, which contributes nothing the ring could
+   * otherwise be caught by.
+   */
   const RING_ANSWER =
     "The article argues that paying readers on the session itself optimises for the feeling of mastery, " +
     "while paying after a delayed check optimises for retention, and that the harder to check version is " +
@@ -1142,16 +1152,27 @@ describe("ATTACK 4 — a five-account syndicate ring", () => {
       results.push(verdict);
     }
 
-    // (a) The FIRST is graded on its merits.
+    // (a) The FIRST is graded on its merits. Its corpus is empty — excluding its
+    // own (also empty) history changes nothing about there being nothing to
+    // match against.
     assert.equal(results[0].status, anticheat.PASS, "the first submitter is graded on its own merits");
     assert.ok(results[0].signature, "and is signed");
     assert.equal(results[0].syndicate.syndicate, false, "with no history to match against, there is no signal");
+    assert.equal(results[0].syndicate.similarity, 0, "an empty corpus reports similarity 0, never a match");
 
-    // Every SUBSEQUENT one is refused as a syndicate.
+    // Every SUBSEQUENT one is refused as a syndicate — RESIDUAL RISK #2 NOT
+    // REGRESSED. Each of them excludes its OWN (empty) history and is still
+    // matched against the FIRST member's row, which is a different account.
     for (let i = 1; i < 5; i += 1) {
       const v = results[i];
       assert.equal(v.status, anticheat.FAIL, `ring member ${i} must be refused`);
       assert.equal(v.syndicate.syndicate, true, `ring member ${i} must be flagged as a syndicate`);
+      assert.equal(
+        v.syndicate.similarity,
+        1,
+        `ring member ${i} is matched against ANOTHER account's text at similarity 1 — the exclusion removes ` +
+          "only the caller's own submissions, never the ring's"
+      );
       assert.ok(
         v.syndicate.similarity > anticheat.SYNDICATE_SIMILARITY_THRESHOLD,
         `ring member ${i}: the refusal must be driven by measured similarity, got ${v.syndicate.similarity}`
@@ -1164,6 +1185,16 @@ describe("ATTACK 4 — a five-account syndicate ring", () => {
       assert.equal(v.signature, undefined, `ring member ${i} must receive NO signature`);
       assert.equal(v.claim, undefined, `ring member ${i} must receive NO claim`);
     }
+
+    // The store-level view of the same property: the last member's corpus held
+    // the four earlier members' rows and none of its own.
+    const lastCorpus = await store.listRecentSubmissions({ excludeUserAddress: RING_USERS[4], limit: 50 });
+    assert.equal(lastCorpus.length, 4, "the final member's corpus holds every earlier member's submission");
+    assert.equal(
+      lastCorpus.some((row) => row.userAddress.toLowerCase() === RING_USERS[4].toLowerCase()),
+      false,
+      "and not one of its own"
+    );
 
     // (b) At most ONE reward for the whole ring.
     const signed = results.filter((v) => typeof v.signature === "string");
@@ -1233,6 +1264,12 @@ describe("ATTACK 4 — a five-account syndicate ring", () => {
     // RESIDUAL WEAKNESS, MEASURED: light paraphrasing falls under the 0.9 bar.
     // These are NOT fixed here (out of scope and not authorised); the numbers
     // are asserted so the weakness cannot regress into invisibility.
+    //
+    // AND THEY ARE UNCHANGED BY THE SELF-COMPARISON FIX. Excluding the
+    // submitter's own rows removes one ADDRESS from the corpus, not a
+    // transformation: a paraphrased copy from another account lands in the same
+    // corpus at the same similarity as before, and the numbers below are the
+    // proof. RESIDUAL RISK #2 SURVIVES THE FIX FOR RISK #3.
     const evaders = Object.entries(measured).filter(([, m]) => m.similarity <= anticheat.SYNDICATE_SIMILARITY_THRESHOLD);
     assert.ok(
       evaders.length > 0,
@@ -1252,41 +1289,180 @@ describe("ATTACK 4 — a five-account syndicate ring", () => {
     }
   });
 
-  test("4e: PROBE — a single honest user submitting the same answer twice is falsely accused. Reported, not hidden", async () => {
-    // What `listRecentSubmissions` actually does: the Judge calls it with
-    // `{ limit }` and NO `userAddress`, so the corpus spans ALL users and
-    // includes the current user's OWN earlier submissions. A syndicate is a
-    // group copying each other, so a per-user query could not see the copy —
-    // but that same choice means an honest user who re-mines the same article
-    // and writes the same summary is compared against their own previous text.
+  test("4e: FIXED — a single honest user submitting the same answer twice now PASSES BOTH TIMES", async () => {
+    // THIS ASSERTION WAS INVERTED. It previously recorded residual risk #3: the
+    // corpus was `{ limit }` with NO `userAddress` at all, so it spanned every
+    // user INCLUDING the caller's own history, and an honest user who re-mined
+    // the same article and wrote the same summary twice was compared against
+    // their own text, matched at similarity 1.0, and refused as a syndicate.
+    //
+    // The store's per-user filter existed and worked; it was simply never used
+    // on this path. `listRecentSubmissions` now takes `excludeUserAddress`, and
+    // the Judge passes the graded `user` as the exclusion — "the corpus is the
+    // recent submissions of OTHER users", not "only users I have something in
+    // common with" and not "one user".
     const user = RING_USERS[0];
     const first = await mine({ user, sessionId: "repeat-1", freeText: RING_ANSWER });
     assert.equal(first.status, anticheat.PASS, "the first attempt is clean");
+    assert.ok(first.signature, "and is signed");
 
+    // The identical text, from the identical wallet, on a fresh session. This is
+    // an honest re-mine, not an attack: nothing about it changed except that it
+    // happened before.
     const second = await mine({ user, sessionId: "repeat-2", freeText: RING_ANSWER });
     assert.equal(
       second.status,
-      anticheat.FAIL,
-      "RESIDUAL WEAKNESS: the second attempt by the SAME user with the SAME answer is refused as a " +
-        "syndicate, because the lookup spans all users including the caller's own history. " +
-        "This is a genuine false positive against an honest re-miner. It is NOT fixed here — the " +
-        "cross-user corpus is the syndicate defence — and it is asserted so it stays visible."
+      anticheat.PASS,
+      "RESIDUAL RISK #3 IS CLOSED: the second attempt by the SAME user with the SAME answer must no longer " +
+        "be refused as a syndicate. Comparing an answer against the submitter's own earlier answer is a " +
+        "comparison with itself; it was a genuine false positive against an honest re-miner."
     );
-    assert.equal(second.syndicate.similarity, 1, "self-comparison is a perfect match");
-    assert.ok(second.result.flags.includes(JUDGE_FLAGS.SYNDICATE_MATCH));
-    assert.equal(second.signature, undefined);
+    assert.equal(second.syndicate.syndicate, false, "and must not be flagged at all");
+    assert.equal(
+      second.syndicate.similarity,
+      0,
+      "the user's own corpus contributed NOTHING to its own similarity computation — with no other user's " +
+        "submissions there is no history at all, and 1.0 (the old self-comparison score) is unreachable"
+    );
+    assert.equal(second.result.flags.includes(JUDGE_FLAGS.SYNDICATE_MATCH), false);
+    assert.equal(second.result.reward, MISSION.reward, "it is paid the full mission reward");
+    assert.ok(second.signature, "a valid signature is issued");
+    assert.ok(second.claim, "and a valid claim comes with it");
 
-    // The store's per-user filter, for the record: it DOES work when asked for,
-    // it is simply not used by the syndicate path.
+    // Two signatures, two DISTINCT nonces: the second pass is a real second
+    // claim, never a replay of the first one.
+    assert.notEqual(first.claim.nonce, second.claim.nonce, "a re-mine must be issued a FRESH, strictly greater nonce");
+    assert.equal(second.claim.nonce, "2", "the per-user counter advances: 1 then 2");
+
+    // Both are real and both settle, which is the whole point: the honest user
+    // is paid twice, once per honest attempt.
+    const relayedFirst = await postJson("/api/relay", relayBody(first.claim, first.signature));
+    assert.equal(relayedFirst.status, 200, `first claim must settle: ${relayedFirst.raw}`);
+    const relayedSecond = await postJson("/api/relay", relayBody(second.claim, second.signature));
+    assert.equal(relayedSecond.status, 200, `second claim must settle: ${relayedSecond.raw}`);
+    assert.equal(chain.settled.length, 2, "both honest attempts were paid");
+    assert.equal(chain.totalSupply, BigInt(first.claim.reward) * 2n);
+
+    // The store-level proof of the same property, in both filter shapes: the
+    // rows ARE there (nothing was deleted or suppressed), they are simply not in
+    // the caller's own corpus.
     const all = await store.listRecentSubmissions({ limit: 50 });
     const scoped = await store.listRecentSubmissions({ userAddress: user, limit: 50 });
-    assert.equal(all.length, 2, "the unfiltered listing spans all users");
-    assert.equal(scoped.length, 2, "the filtered listing returns only this user's rows");
-    assert.equal(
-      all.some((row) => row.userAddress !== user),
-      false,
-      "in this scenario every row happens to be the caller's, which is exactly the false-positive shape"
+    const others = await store.listRecentSubmissions({ excludeUserAddress: user, limit: 50 });
+    assert.equal(all.length, 2, "both submissions are stored: the audit trail is untouched");
+    assert.equal(scoped.length, 2, "the inclusive filter returns this user's rows");
+    assert.equal(others.length, 0, "and the EXCLUSIVE filter — the syndicate corpus — returns none of them");
+  });
+
+  test("4f: NEAR-MISS — the same user submitting genuinely DIFFERENT summaries twice passes, and the detector is still armed", async () => {
+    // The near-miss guard on the fix. Excluding own submissions must not have
+    // made the detector toothless: two different honest summaries from one
+    // wallet both pass, AND an identical copy of the first one from a DIFFERENT
+    // wallet is still refused.
+    const summaryOne =
+      "My own summary: delayed payment rewards people who come back, immediate payment rewards people " +
+      "who finish the page once, and the author is suspicious of both and prefers the one that is harder " +
+      "to game with a script.";
+    const summaryTwo =
+      "Reading it again: the article treats payment timing as a design choice, because paying late pulls " +
+      "readers back while paying now only proves a page was opened, and the version with a delay is also " +
+      "the version a farm of scripts cannot satisfy.";
+    const author = RING_USERS[3];
+
+    const first = await mine({ user: author, sessionId: "near-1", freeText: summaryOne });
+    assert.equal(first.status, anticheat.PASS, "an original summary must pass");
+
+    const second = await mine({ user: author, sessionId: "near-2", freeText: summaryTwo });
+    assert.equal(second.status, anticheat.PASS, "a genuinely different second summary must also pass");
+    assert.equal(second.syndicate.syndicate, false, "and must not be flagged as a syndicate either");
+    assert.ok(second.signature, "and must be paid");
+
+    // Not toothless: a DIFFERENT account submitting the first author's words
+    // verbatim is exactly ATTACK 4a, and it is still caught. The exclusion
+    // removed ONE address from the corpus, not the corpus.
+    const accomplice = await mine({ user: RING_USERS[4], sessionId: "near-3", freeText: summaryOne });
+    assert.equal(accomplice.status, anticheat.FAIL, "a cross-account verbatim copy must still be refused");
+    assert.equal(accomplice.syndicate.syndicate, true);
+    assert.ok(accomplice.syndicate.similarity > anticheat.SYNDICATE_SIMILARITY_THRESHOLD);
+    assert.ok(
+      accomplice.result.flags.includes(JUDGE_FLAGS.SYNDICATE_MATCH),
+      `the refusal must name the syndicate signal, got ${JSON.stringify(accomplice.result.flags)}`
     );
+    assert.equal(accomplice.signature, undefined, "and it must receive no signature");
+    assert.equal(chain.settled.length, 0, "the two honest authors were never relayed, so nothing settled here");
+  });
+
+  test("4g: MIXED RING — a repeat offender whose own history is excluded is STILL caught by the ring", async () => {
+    // The case that proves the fix did not degrade "exclude my own history" into
+    // "exclude everyone". RING_USERS[0] is a REPEAT OFFENDER: it submits the
+    // same ring answer twice and is (correctly) paid twice, because its own rows
+    // are not in its corpus. RING_USERS[1] then submits the same words.
+    //
+    // RING_USERS[1] excludes ITS OWN history — which contains nothing, it has
+    // never submitted — and still sees both of RING_USERS[0]'s rows. The ring is
+    // two accounts wide and is caught by the OTHER member's submissions, which
+    // is the entire reason the corpus stays cross-user.
+    const ringLeader = RING_USERS[0];
+    const ringSecond = RING_USERS[1];
+
+    const leaderFirst = await mine({ user: ringLeader, sessionId: "mixed-1", freeText: RING_ANSWER });
+    assert.equal(leaderFirst.status, anticheat.PASS, "the first ring member is graded on its merits");
+    const leaderRepeat = await mine({ user: ringLeader, sessionId: "mixed-2", freeText: RING_ANSWER });
+    assert.equal(leaderRepeat.status, anticheat.PASS, "and its own repeat is not self-compared into a refusal");
+
+    // The corpus the second member will actually be compared against: two rows,
+    // both the OTHER member's, none of its own.
+    const secondMemberCorpus = await store.listRecentSubmissions({ excludeUserAddress: ringSecond, limit: 50 });
+    assert.equal(secondMemberCorpus.length, 2, "the second member's corpus holds both rows the leader stored");
+    assert.equal(
+      secondMemberCorpus.every((row) => row.userAddress.toLowerCase() === ringLeader.toLowerCase()),
+      true,
+      "and every one of them belongs to the OTHER member: the exclusion removed only the caller's own rows"
+    );
+
+    const flagged = await mine({ user: ringSecond, sessionId: "mixed-3", freeText: RING_ANSWER });
+    assert.equal(flagged.status, anticheat.FAIL, "the second member of a two-account ring is still refused");
+    assert.equal(flagged.syndicate.syndicate, true, "and is still named a syndicate");
+    assert.equal(
+      flagged.syndicate.similarity,
+      1,
+      "at similarity 1: the text it is matched against came from ANOTHER account, which is the whole point"
+    );
+    assert.ok(flagged.result.flags.includes(JUDGE_FLAGS.SYNDICATE_MATCH));
+    assert.equal(flagged.result.reward, 0);
+    assert.equal(flagged.signature, undefined, "NO signature for the ring member");
+    assert.equal(flagged.claim, undefined, "NO claim for the ring member");
+
+    // Exactly two signatures exist in this scenario and both belong to the leader.
+    const signed = [leaderFirst, leaderRepeat, flagged].filter((v) => typeof v.signature === "string");
+    assert.equal(signed.length, 2, "only the leader's two honest-ish submissions are signed");
+    assert.notEqual(leaderFirst.claim.nonce, leaderRepeat.claim.nonce, "and they carry distinct nonces");
+  });
+
+  test("4h: EMPTY CORPUS — the very first submission on a fresh store still PASSES", async () => {
+    // Regression guard for the new filter. With `excludeUserAddress` set on a
+    // store nobody has submitted to, the corpus is EMPTY, and an empty corpus
+    // must be "no signal" (similarity 0, not a syndicate) rather than a failure.
+    // This is the first-submitter path: if the exclusion could turn an empty
+    // corpus into a FAIL, the very first honest user on a fresh deployment
+    // would be paid nothing.
+    const freshStore = createMemoryStore();
+    assert.deepEqual(await freshStore.listRecentSubmissions({ excludeUserAddress: VICTIM, limit: 50 }), []);
+    assert.deepEqual(await freshStore.listRecentSubmissions({ excludeUserAddress: undefined, limit: 50 }), []);
+
+    // The store the harness booted has no submissions at all yet either.
+    assert.deepEqual(await store.listRecentSubmissions({ excludeUserAddress: VICTIM, limit: 50 }), []);
+
+    const user = RING_USERS[5];
+    const verdict = await mine({ user, sessionId: "first-ever", freeText: RING_ANSWER });
+    assert.equal(verdict.status, anticheat.PASS, "the first submission of a fresh deployment must still be paid");
+    assert.deepEqual(
+      verdict.syndicate,
+      { syndicate: false, similarity: 0 },
+      "an empty corpus produces no signal at all — not a match, and not an error"
+    );
+    assert.ok(verdict.signature, "and a signature is issued");
+    assert.equal(verdict.claim.nonce, "1", "with the first nonce");
   });
 });
 

@@ -337,6 +337,29 @@ function normalizeAddress(value) {
 }
 
 /**
+ * Canonical comparison form of an address FILTER, or `null` for "no filter".
+ *
+ * Distinct from `normalizeAddress` above, which is about STORED values and
+ * preserves `null` as a legitimate "no address recorded". A filter is different:
+ * an absent filter and a blank one (`""`, whitespace) both mean "do not filter
+ * by address", so this returns `null` for both. Returning `null` matters most
+ * for `excludeUserAddress`, where a blank value must not turn into a predicate
+ * that silently drops nothing — or, worse, into a filter that matches no one.
+ *
+ * `storage.js` documents the four filter combinations and the reasons; this is
+ * the SQLite half of that same specification, and the parity test runs both
+ * halves against the same script.
+ *
+ * @param {*} value Candidate address filter.
+ * @returns {string|null} Lowercase address, or `null` for "no filter".
+ */
+function addressScope(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim().toLowerCase();
+  return text === "" ? null : text;
+}
+
+/**
  * Canonical storage form of a uint256-ish quantity: a decimal string with no
  * sign, exponent, padding or leading zeroes, or `null`.
  *
@@ -543,6 +566,28 @@ function createSqliteStore({ filename, logger, createDirectory } = {}) {
       `SELECT id, session_id, user_address, mission_id, submitted_at, answers_json, highlight, typing_ms,
               free_text, status, result_json, reward_json, stamina_cost_json
          FROM submissions WHERE user_address = ? ORDER BY submitted_at DESC, id DESC LIMIT ?`
+    ),
+    // The exclusive filter for the syndicate corpus (residual risk #3): every
+    // OTHER user. `user_address IS NULL` is kept deliberately — a submission
+    // with no recorded address belongs to nobody, so it is nobody's own
+    // history and the memory adapter's `who !== exclude` comparison keeps it
+    // too. The predicate is a FILTER over the `submissions_recent` index (a
+    // `<>` cannot seek), which is exactly why the corpus stays a bounded
+    // window; see the risk #2 note in storage.js.
+    selectRecentExcludingUser: db.prepare(
+      `SELECT id, session_id, user_address, mission_id, submitted_at, answers_json, highlight, typing_ms,
+              free_text, status, result_json, reward_json, stamina_cost_json
+         FROM submissions WHERE user_address IS NULL OR user_address <> ?
+         ORDER BY submitted_at DESC, id DESC LIMIT ?`
+    ),
+    // Both filters at once. Distinct addresses: that user's rows (no row can
+    // be both). Identical addresses: nothing, the documented degenerate case —
+    // never "that user's rows" and never "everyone".
+    selectRecentForUserExcludingUser: db.prepare(
+      `SELECT id, session_id, user_address, mission_id, submitted_at, answers_json, highlight, typing_ms,
+              free_text, status, result_json, reward_json, stamina_cost_json
+         FROM submissions WHERE user_address = ? AND user_address <> ?
+         ORDER BY submitted_at DESC, id DESC LIMIT ?`
     ),
     selectCounter: db.prepare("SELECT last_nonce FROM nonce_counters WHERE user_address = ?"),
     upsertCounter: db.prepare(
@@ -781,22 +826,50 @@ function createSqliteStore({ filename, logger, createDirectory } = {}) {
     },
 
     /**
-     * Newest-first submission list. WITHOUT `userAddress` the list spans ALL
-     * users, which is the mode syndicate detection depends on: a syndicate is a
-     * group of submitters copying each other, and a per-user query can never
-     * see the copy.
+     * Newest-first submission list, filtered by address. WITHOUT any address
+     * filter the list spans ALL users — still the shape any admin/debug view
+     * wants, and unchanged for every existing caller.
+     *
+     * `userAddress` is INCLUSIVE ("only this user") and `excludeUserAddress` is
+     * EXCLUSIVE ("everyone but this user"). The exclusive form is the SYNDICATE
+     * CORPUS: a syndicate is a group of submitters copying each other, so the
+     * query has to span users — but the submitter's OWN rows must come out, or
+     * an honest user who writes the same summary twice is refused by their own
+     * text at similarity 1.0 (residual risk #3). The two filters are
+     * independent and composable; all four combinations, including the
+     * degenerate one where both names are the same address and the answer is
+     * legitimately nothing, are specified in `storage.js` and asserted in
+     * test/sqlite-store.test.js against BOTH adapters.
+     *
+     * Addresses are normalised (lowercased) on the way in and are stored
+     * lowercase, so both predicates compare in one canonical form. A
+     * `user_address` of NULL is kept by the exclusive filter and dropped by the
+     * inclusive one, matching the memory adapter exactly.
      *
      * @param {Object} [params]
-     * @param {string} [params.userAddress Restrict to one wallet; omit for all users.
-     * @param {number} [params.limit] Maximum rows; defaults to 50.
+     * @param {string} [params.userAddress INCLUSIVE filter: ONLY this wallet.
+     * @param {string} [params.excludeUserAddress EXCLUSIVE filter: everyone but
+     *   this wallet. The syndicate corpus.
+     * @param {number} [params.limit] Maximum rows AFTER filtering; defaults to 50.
      * @returns {Promise<Array<Object>>} Newest-first submission records.
      */
-    async listRecentSubmissions({ userAddress, limit } = {}) {
+    async listRecentSubmissions({ userAddress, excludeUserAddress, limit } = {}) {
       const max = Number.isInteger(limit) && limit > 0 ? limit : 50;
-      const rows =
-        userAddress === undefined || userAddress === null
-          ? stmt.selectRecentAll.all(max)
-          : stmt.selectRecentForUser.all(normalizeAddress(userAddress), max);
+      const include = addressScope(userAddress);
+      const exclude = addressScope(excludeUserAddress);
+      let rows;
+      if (include === null && exclude === null) {
+        rows = stmt.selectRecentAll.all(max);
+      } else if (include === null) {
+        rows = stmt.selectRecentExcludingUser.all(exclude, max);
+      } else if (exclude === null) {
+        rows = stmt.selectRecentForUser.all(include, max);
+      } else {
+        // The same address on both sides is the documented degenerate case:
+        // `user_address = ? AND user_address <> ?` is unsatisfiable and yields
+        // no rows, which is the honest answer rather than "everyone".
+        rows = stmt.selectRecentForUserExcludingUser.all(include, exclude, max);
+      }
       return rows.map(toSubmission);
     },
 

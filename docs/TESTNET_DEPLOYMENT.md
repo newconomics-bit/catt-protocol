@@ -31,19 +31,25 @@
 
 | Bucket | Amount | % of `MAX_SUPPLY` | % of genesis | Notes |
 |---|---:|---:|---:|---|
-| Team vesting | 15,000,000 CATT | 15.00% | 23.07% | locked: 1-year cliff, then 3 years linear |
-| Treasury | 20,000,000 CATT | 20.00% | 30.76% | paid to `TREASURY_BENEFICIARY`; *registered* in `TeamVesting`'s schedule |
-| Liquidity | 30,000,000 CATT | 30.00% | 46.15% | free float for the DEX pair |
-| **Genesis mint** | **65,000,000 CATT** | **65.00%** | **100.00%** | the sum of the three rows above |
-| Mining headroom | 35,000,000 CATT | 35.00% | — | never minted here; the mining emission budget |
+| Team vesting | 15,000,000 CATT | 15.00% | 25.00% | locked: 1-year cliff, then 3 years linear |
+| Treasury | 20,000,000 CATT | 20.00% | 33.33% | paid to `TREASURY_BENEFICIARY`; *registered* in `TeamVesting`'s schedule |
+| Marketing | 15,000,000 CATT | 15.00% | 25.00% | paid to `MARKETING_WALLET`; a **separate** bucket, never folded into liquidity |
+| DEX liquidity | 10,000,000 CATT | 10.00% | 16.67% | free float for the DEX pair, to `LIQUIDITY_WALLET` |
+| **Genesis mint** | **60,000,000 CATT** | **60.00%** | **100.00%** | the sum of the four rows above |
+| Mining headroom | 40,000,000 CATT | 40.00% | — | never minted here; the mining emission budget |
 
-Why genesis is 65M and not 100M: `MiningClaimer` becomes the **sole** minter
+Why genesis is 60M and not 100M: `MiningClaimer` becomes the **sole** minter
 after the ownership transfer, and every mining reward mints *on top of* the
 genesis supply. Minting the full `MAX_SUPPLY` at genesis would leave zero
 headroom and make **every single claim revert** with `MintExceedsMaxSupply`. The
 script refuses to run if you configure `INITIAL_SUPPLY` at or above
 `MAX_SUPPLY`, and it prints both columns above so the split is auditable.
-`INITIAL_SUPPLY` must also be `> 35,000,000` so the liquidity bucket is positive.
+
+`INITIAL_SUPPLY` is **derived from the four buckets**, not configured
+independently of them. It defaults to `60000000`; if you set it to anything
+other than the bucket sum the script aborts rather than mint a supply the
+buckets do not account for, and the module itself throws if the four bucket
+constants ever stop summing to 60,000,000.
 
 ---
 
@@ -81,6 +87,7 @@ already loads (`.env` via `dotenv`). Copy `smart-contracts/.env.example` to
 | `SIGNER_ADDRESS` | Backend Judge address → `MiningClaimer.signer` | validated: must be `0x` + 40 hex and non-zero, else the script aborts before deploying anything. A typo here means **no user can ever claim** |
 | `TEAM_BENEFICIARY` | 15,000,000 CATT vesting beneficiary | must be a valid address |
 | `TREASURY_BENEFICIARY` | 20,000,000 CATT vesting beneficiary | must differ from `TEAM_BENEFICIARY` (`TeamVesting` reverts `DuplicateBeneficiary`) |
+| `MARKETING_WALLET` | 15,000,000 CATT **marketing** allocation | **Required, no default.** Marketing is its own labelled bucket: it is never folded into the liquidity bucket and never silently left on the deployer. Must be a valid, non-zero address; the script warns if it equals the deployer or `LIQUIDITY_WALLET` |
 | `YIELD_TOKEN_ADDRESS` | Real stablecoin for `BondManager` | **Required unless you use the mock** (§3). Must not equal the CATT address |
 
 ### Optional
@@ -88,8 +95,8 @@ already loads (`.env` via `dotenv`). Copy `smart-contracts/.env.example` to
 | Variable | Default | Meaning |
 |---|---|---|
 | `MOCK_YIELD` | `false` | `true` deploys `contracts/mocks/MockUSDT.sol` and uses it as the yield token. Test-only. |
-| `LIQUIDITY_WALLET` | the deployer | Recipient of the 30,000,000 CATT liquidity allocation. The script warns loudly when it is unset. |
-| `INITIAL_SUPPLY` | `65000000` | Genesis mint in whole CATT. `> 35000000`, `< 100000000`. |
+| `LIQUIDITY_WALLET` | the deployer | Recipient of the 10,000,000 CATT DEX liquidity allocation. The script warns loudly when it is unset. |
+| `INITIAL_SUPPLY` | `60000000` | Genesis mint in whole CATT, **derived from the four buckets**. If set it must equal that derived total exactly, and it must stay `< 100000000` (MAX_SUPPLY). |
 | `DEPLOYMENT_OUTPUT` | `smart-contracts/deployed-testnet.json` | Where the manifest is written. **Deployment output — never commit it.** |
 | `EXPECTED_CHAIN_ID` | `80002` | Chain id the deployment is expected to run on. Mismatch warns; a *mainnet* id aborts unless `--force`. |
 | `FORCE` | `false` | `true` overwrites an existing manifest (see §5). |
@@ -116,6 +123,7 @@ node scripts/deploy-testnet.js --mock-yield --dry-run
 ```bash
 cd smart-contracts
 SIGNER_ADDRESS=0x...  TEAM_BENEFICIARY=0x...  TREASURY_BENEFICIARY=0x... \
+MARKETING_WALLET=0x...  LIQUIDITY_WALLET=0x... \
 MOCK_YIELD=true DEPLOYMENT_OUTPUT=/tmp/deployed-testnet.json \
 npx hardhat run scripts/deploy-testnet.js
 ```
@@ -128,7 +136,7 @@ verification results, and writes the manifest outside the repo.
 ```bash
 cd smart-contracts
 # .env holds PRIVATE_KEY, POLYGON_RPC_URL (Amoy), SIGNER_ADDRESS,
-# TEAM_BENEFICIARY, TREASURY_BENEFICIARY, LIQUIDITY_WALLET
+# TEAM_BENEFICIARY, TREASURY_BENEFICIARY, MARKETING_WALLET, LIQUIDITY_WALLET
 MOCK_YIELD=true npx hardhat run scripts/deploy-testnet.js --network polygon
 ```
 
@@ -199,7 +207,7 @@ cast send $CATT "mint(address,uint256)" $DEPLOYER 1 --private-key $PRIVATE_KEY -
 
 Expected: items 1 and 2 equal the `MiningClaimer` address; item 3 equals
 `15000000000000000000000000`; item 4 equals your genesis mint
-(`65000000000000000000000000` by default) and is below
+(`60000000000000000000000000` by default) and is below
 `100000000000000000000000000`; item 7 reverts with `OwnableUnauthorizedAccount`.
 
 Then point the backend at the deployment (`backend-server/.env`, keys already
@@ -226,8 +234,8 @@ RPC_URL=<Amoy RPC>
   "constructorArguments": { "TeamVesting": ["0x...", "0x...", "0x...", "15...e18", "20...e18"] },
   "yieldToken": { "address": "0x...", "kind": "MOCK | REAL_FROM_ENV", "note": "..." },
   "initialAllocation": {
-    "totalMinted": "65000000000000000000000000",
-    "miningHeadroom": "35000000000000000000000000",
+    "totalMinted": "60000000000000000000000000",
+    "miningHeadroom": "40000000000000000000000000",
     "buckets": [ { "label": "team vesting", "amount": "...", "percentOfMaxSupply": "15.00%", "tx": "0x..." } ]
   },
   "wiring": { "transferOwnershipTx": "0x...", "setClaimerTx": "0x...", "verification": [ ... ], "allChecksPassed": true },

@@ -30,6 +30,7 @@ const { createMemoryStore, assertStoreShape, STORAGE_METHODS, STORAGE_ADAPTERS, 
 
 const USER_A = "0x1111111111111111111111111111111111111111";
 const USER_B = "0x2222222222222222222222222222222222222222";
+const USER_C = "0x3333333333333333333333333333333333333333";
 const TX_A = "0x" + "ab".repeat(32);
 const TX_B = "0x" + "cd".repeat(32);
 const TX_C = "0x" + "ef".repeat(32);
@@ -147,6 +148,25 @@ test("parity: memory and sqlite agree on the same scripted sequence", async () =
     log.recentScoped = await store.listRecentSubmissions({ userAddress: USER_B, limit: 10 });
     log.recentLimited = await store.listRecentSubmissions({ limit: 1 });
     log.recentDefaulted = await store.listRecentSubmissions({});
+    // The exclusive filter (residual risk #3): the syndicate corpus is everyone
+    // BUT the submitter. Exercised here so the two adapters are compared on the
+    // new parameter too, not just on the old one.
+    log.recentExcludingA = await store.listRecentSubmissions({ excludeUserAddress: USER_A, limit: 10 });
+    log.recentExcludingUnknown = await store.listRecentSubmissions({
+      excludeUserAddress: "0x9999999999999999999999999999999999999999",
+      limit: 10,
+    });
+    log.recentBothDegenerate = await store.listRecentSubmissions({
+      userAddress: USER_A,
+      excludeUserAddress: USER_A,
+      limit: 10,
+    });
+    log.recentBothDistinct = await store.listRecentSubmissions({
+      userAddress: USER_A,
+      excludeUserAddress: USER_B,
+      limit: 10,
+    });
+    log.recentExcludingLimited = await store.listRecentSubmissions({ excludeUserAddress: USER_A, limit: 1 });
 
     log.nonces = [];
     for (let i = 0; i < 3; i += 1) log.nonces.push(await store.reserveNonce(USER_A));
@@ -249,6 +269,15 @@ test("parity: memory and sqlite agree on the same scripted sequence", async () =
   assert.deepEqual(b.recentAll.map((row) => row.userAddress), [USER_B, USER_A], "newest-first across ALL users");
   assert.deepEqual(b.recentScoped.map((row) => row.id), [a.submissionB.id]);
   assert.deepEqual(b.recentLimited.length, 1);
+  assert.deepEqual(b.recentExcludingA.map((row) => row.userAddress), [USER_B], "excludeUserAddress keeps only OTHER users");
+  assert.deepEqual(
+    b.recentExcludingUnknown.map((row) => row.userAddress),
+    [USER_B, USER_A],
+    "excluding an address nobody used changes nothing"
+  );
+  assert.deepEqual(b.recentBothDegenerate, [], "userAddress === excludeUserAddress is the empty set, not a fallback");
+  assert.deepEqual(b.recentBothDistinct.map((row) => row.userAddress), [USER_A], "two different addresses compose");
+  assert.deepEqual(b.recentExcludingLimited.length, 1, "limit is applied AFTER filtering");
   assert.deepEqual(b.markFirst, true);
   assert.deepEqual(b.markSecond, false);
   assert.equal(b.claimRelayed.relayerTxHash, TX_A, "the winning relay hash must never be overwritten");
@@ -540,6 +569,180 @@ test("ordering: listRecentSubmissions is newest-first and spans all users", asyn
   assert.equal((await store.listRecentSubmissions({})).length, 3);
   assert.equal((await store.listRecentSubmissions({ limit: 0 })).length, 3, "a nonsensical limit falls back to the default");
   await store.close();
+});
+
+/* ========================================================================== */
+/* 6b. The exclusive address filter (`excludeUserAddress`)                     */
+/* ========================================================================== */
+
+/**
+ * Runs the whole `excludeUserAddress` specification against ONE adapter and
+ * returns what it saw, so the identical script can be run against both and
+ * compared. The fixture is four submissions across three addresses plus one
+ * with no address at all, inserted oldest-first: A, B, A, C, (null).
+ *
+ * The parameter exists for residual risk #3: the syndicate corpus must be the
+ * recent submissions of OTHER users, or an honest user who writes the same
+ * summary twice is compared against their own text and refused.
+ */
+async function exclusionScript(store) {
+  const save = (user, text) =>
+    store.saveSubmission({
+      sessionId: "s-1",
+      userAddress: user,
+      missionId: "m-1",
+      answers: [0],
+      highlight: "h",
+      typingMs: 1,
+      freeText: text,
+      result: { status: "PASS" },
+    });
+  await save(USER_A, "a1");
+  await save(USER_B, "b1");
+  await save(USER_A, "a2");
+  await save(USER_C, "c1");
+  await save(null, "anon");
+
+  const texts = async (params) => (await store.listRecentSubmissions(params)).map((row) => row.freeText);
+
+  return {
+    neither: await texts({ limit: 10 }),
+    includeOnly: await texts({ userAddress: USER_A, limit: 10 }),
+    excludeOnly: await texts({ excludeUserAddress: USER_A, limit: 10 }),
+    bothSameAddress: await texts({ userAddress: USER_A, excludeUserAddress: USER_A, limit: 10 }),
+    bothDistinct: await texts({ userAddress: USER_A, excludeUserAddress: USER_B, limit: 10 }),
+    excludeUnknown: await texts({ excludeUserAddress: "0x9999999999999999999999999999999999999999", limit: 10 }),
+    excludeUnlimited: await texts({ excludeUserAddress: USER_A }),
+    excludeLimit1: await texts({ excludeUserAddress: USER_A, limit: 1 }),
+    excludeLimit2: await texts({ excludeUserAddress: USER_A, limit: 2 }),
+    includeLimit1: await texts({ userAddress: USER_A, limit: 1 }),
+    limit0FallsBack: (await texts({ excludeUserAddress: USER_A, limit: 0 })).length,
+    emptyStoreShape: (await texts({ excludeUserAddress: undefined, limit: 10 })).length,
+  };
+}
+
+test("excludeUserAddress: all four filter combinations behave exactly as specified", async () => {
+  const { store } = await openStore();
+  const seen = await exclusionScript(store);
+
+  // NEITHER filter: everyone, newest first. The pre-existing behaviour, which
+  // every other caller (and the relay/debug views) depends on.
+  assert.deepEqual(seen.neither, ["anon", "c1", "a2", "b1", "a1"], "no filter spans ALL users, newest first");
+
+  // `userAddress` ALONE: "ONLY this user". Unchanged from before this parameter
+  // existed.
+  assert.deepEqual(seen.includeOnly, ["a2", "a1"], "the inclusive filter returns only that user's rows");
+
+  // `excludeUserAddress` ALONE: "everyone BUT this user" — THE SYNDICATE CASE.
+  // An anonymous row belongs to nobody, so it is nobody's own history and it is
+  // kept, exactly as the memory adapter keeps it.
+  assert.deepEqual(seen.excludeOnly, ["anon", "c1", "b1"], "the exclusive filter returns every OTHER user");
+
+  // BOTH, same address: DEGENERATE and honestly empty. Not "that user's rows"
+  // (which would invert the caller's intent) and not "everyone" (which would
+  // leak the very history the caller excluded).
+  assert.deepEqual(seen.bothSameAddress, [], "userAddress === excludeUserAddress is the empty set, not a fallback");
+
+  // BOTH, different addresses: composable, and the exclusion is a no-op because
+  // no row can be both.
+  assert.deepEqual(seen.bothDistinct, ["a2", "a1"], "two distinct addresses compose to that user's rows");
+
+  // Excluding an address nobody has used is harmless.
+  assert.deepEqual(seen.excludeUnknown, ["anon", "c1", "a2", "b1", "a1"], "an unused exclusion changes nothing");
+
+  // A row with NO recorded address: kept by the exclusive filter (it is nobody's
+  // own history) and dropped by the inclusive one (it is nobody's rows).
+  assert.equal(seen.emptyStoreShape, 5);
+  await store.close();
+});
+
+test("excludeUserAddress: newest-first ordering and limit still hold AFTER filtering", async () => {
+  const { store } = await openStore();
+  const seen = await exclusionScript(store);
+
+  // The limit counts rows the caller ACTUALLY RECEIVES. A naive implementation
+  // that takes the newest 50 rows and then discards the caller's own would hand
+  // back fewer than the limit asked for — here it does not, and that is the
+  // property that keeps the corpus the full size of the window.
+  assert.deepEqual(seen.excludeUnlimited, ["anon", "c1", "b1"], "an omitted limit falls back to the default");
+  assert.deepEqual(seen.excludeLimit1, ["anon"], "limit 1 after filtering returns the newest SURVIVING row");
+  assert.deepEqual(seen.excludeLimit2, ["anon", "c1"], "and limit 2 the two newest surviving rows");
+  assert.deepEqual(seen.includeLimit1, ["a2"], "the same holds for the inclusive filter");
+
+  // The order is newest-first by (submitted_at, id) with the excluded address
+  // removed, NOT the raw newest-N-with-holes-in-it. `c1` is the 4th submission
+  // overall but the 2nd newest surviving row, which is the difference.
+  assert.equal(seen.excludeLimit2[0], "anon");
+  assert.equal(seen.excludeLimit2[1], "c1");
+
+  // A nonsensical limit still falls back to the default rather than returning nothing.
+  assert.equal(seen.limit0FallsBack, 3, "limit 0 falls back to the default, applied after filtering");
+  await store.close();
+});
+
+test("excludeUserAddress: case differences must not let a user back into their own corpus", async () => {
+  // A user may present the checksummed form it was given while another call site
+  // stores the lowercase form. They are the same wallet, and a case-sensitive
+  // exclusion would let their own earlier answer back into their own corpus —
+  // residual risk #3 reintroduced through address casing.
+  const MIXED_A = "0xaBcDeF0123456789aBcDeF0123456789AbCdEf01";
+  for (const store of [createMemoryStore(), createSqliteStore({ filename: tempDbPath("casing") })]) {
+    await store.saveSubmission({
+      sessionId: "s-1",
+      userAddress: MIXED_A,
+      missionId: "m-1",
+      answers: [0],
+      highlight: "h",
+      typingMs: 1,
+      freeText: "mine",
+      result: { status: "PASS" },
+    });
+    await store.saveSubmission({
+      sessionId: "s-2",
+      userAddress: USER_B,
+      missionId: "m-1",
+      answers: [0],
+      highlight: "h",
+      typingMs: 1,
+      freeText: "theirs",
+      result: { status: "PASS" },
+    });
+
+    assert.equal(
+      (await store.listRecentSubmissions({ excludeUserAddress: MIXED_A.toLowerCase() })).length,
+      1,
+      "a lowercase exclusion must remove the checksummed row"
+    );
+    assert.equal(
+      (await store.listRecentSubmissions({ excludeUserAddress: MIXED_A })).length,
+      1,
+      "and a checksummed exclusion must remove it too"
+    );
+    assert.equal(
+      (await store.listRecentSubmissions({ excludeUserAddress: "0xABCDEF0123456789ABCDEF0123456789ABCDEF01" })).length,
+      1,
+      "including the fully upper-cased form"
+    );
+    assert.equal((await store.listRecentSubmissions({ userAddress: MIXED_A.toLowerCase() })).length, 1);
+    await store.close();
+  }
+});
+
+test("excludeUserAddress: memory and sqlite return IDENTICAL views of the same script", async () => {
+  const memory = createMemoryStore();
+  const sqlite = createSqliteStore({ filename: tempDbPath("parity-exclude") });
+  await sqlite.init();
+
+  const [a, b] = [await exclusionScript(memory), await exclusionScript(sqlite)];
+  assert.deepEqual(b, a, "the two adapters disagreed about excludeUserAddress");
+
+  // Named again, so a failure says WHICH combination broke.
+  assert.deepEqual(b.excludeOnly, ["anon", "c1", "b1"], "the syndicate corpus is identical in both adapters");
+  assert.deepEqual(b.bothSameAddress, [], "and the degenerate composition is identical in both");
+  assert.deepEqual(b.includeOnly, a.includeOnly);
+  assert.deepEqual(b.neither, a.neither, "the unfiltered listing is unchanged in both");
+
+  await sqlite.close();
 });
 
 test("sessions: a repeat createSession never wipes telemetry, and fill-in is allowed", async () => {

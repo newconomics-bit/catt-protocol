@@ -57,16 +57,28 @@
  *   TREASURY_BENEFICIARY    20,000,000 CATT vesting beneficiary. Must differ
  *                           from TEAM_BENEFICIARY (TeamVesting reverts on a
  *                           duplicate beneficiary).
- *   LIQUIDITY_WALLET         Recipient of the initial liquidity allocation.
- *                           Optional; defaults to the deployer with a loud
- *                           warning, because on a testnet the deployer is fine.
+ *   MARKETING_WALLET         Recipient of the SEPARATE 15,000,000 CATT
+ *                           marketing allocation. REQUIRED: marketing is its
+ *                           own labelled bucket, it is never folded into the
+ *                           liquidity bucket, and it deliberately has NO
+ *                           default — the deployer is not an acceptable
+ *                           destination. The script aborts if it is unset and
+ *                           warns loudly if it collides with another
+ *                           destination.
+ *   LIQUIDITY_WALLET         Recipient of the 10,000,000 CATT DEX liquidity
+ *                           allocation. Optional; defaults to the deployer
+ *                           with a loud warning, because on a testnet the
+ *                           deployer is fine.
  *   YIELD_TOKEN_ADDRESS     Real stablecoin for BondManager. Required unless
  *                           --mock-yield / MOCK_YIELD=true.
- *   INITIAL_SUPPLY          Optional. Genesis mint total in whole CATT,
- *                           default 65,000,000. Must be > 35,000,000 (team +
- *                           treasury) and <= 100,000,000 (MAX_SUPPLY), and
- *                           MUST leave non-zero headroom for mining rewards
- *                           (see INITIAL ALLOCATION below).
+ *   INITIAL_SUPPLY          Optional. Genesis mint total in whole CATT. It is
+ *                           DERIVED from the four buckets below and defaults to
+ *                           60,000,000. If set, it must equal that derived
+ *                           total exactly: the script refuses to run rather
+ *                           than mint a genesis supply the buckets do not
+ *                           account for. The result must also stay below
+ *                           100,000,000 (MAX_SUPPLY) so mining headroom is
+ *                           non-zero (see INITIAL ALLOCATION below).
  *   DEPLOYMENT_OUTPUT       Optional. Path of the JSON manifest, default
  *                           <repo>/smart-contracts/deployed-testnet.json.
  *                           Deployment output: never commit it.
@@ -108,36 +120,67 @@ const ONE = 10n ** 18n;
 const MAX_SUPPLY_CATT = 100_000_000n;
 
 /**
- * INITIAL ALLOCATION (PRD Section 3.3 + TeamVesting's constructor NatSpec).
+ * INITIAL ALLOCATION (PRD Section 3.4 "Token Allocation" + TeamVesting's
+ * constructor NatSpec). This is the authoritative PRD split and nothing else
+ * is permitted to appear here.
  *
- * Team and treasury are pinned by `TeamVesting`'s documented deployment
- * values: 15,000,000 CATT (15% of the 100,000,000 MAX_SUPPLY) and 20,000,000
- * CATT (20% of MAX_SUPPLY) — 35% of the cap, both locked behind the 1-year
- * cliff + 3-year linear schedule.
+ * The four genesis buckets, each with its own destination:
  *
- * The remaining 65% of the cap is NOT all minted at genesis, because
+ *   team vesting        15,000,000 CATT  15.00% of MAX_SUPPLY  25.00% of genesis
+ *   treasury            20,000,000 CATT  20.00% of MAX_SUPPLY  33.33% of genesis
+ *   marketing           15,000,000 CATT  15.00% of MAX_SUPPLY  25.00% of genesis
+ *   DEX liquidity       10,000,000 CATT  10.00% of MAX_SUPPLY  16.67% of genesis
+ *   ------------------------------------------------------------
+ *   genesis total       60,000,000 CATT  60.00% of MAX_SUPPLY 100.00% of genesis
+ *   mining headroom     40,000,000 CATT  40.00% of MAX_SUPPLY  (never minted here)
+ *
+ * Team and treasury are additionally pinned by `TeamVesting`'s documented
+ * constructor values (15,000,000e18 and 20,000,000e18), so those two cannot
+ * drift. Marketing is a SEPARATE bucket with its own destination and is never
+ * folded into liquidity; liquidity is 10,000,000, not the 30,000,000 an earlier
+ * revision of this script used.
+ *
+ * The remaining 40% of the cap is NOT minted at genesis, because
  * `MiningClaimer` is the sole minter after `transferOwnership` and every
- * mining reward mints on top of the genesis supply: minting the full 100,000,000
- * at genesis would leave ZERO headroom and make every single claim revert with
- * `MintExceedsMaxSupply`. The default genesis mint is therefore 65,000,000 CATT
- * (65% of the cap):
+ * mining reward mints ON TOP of the genesis supply: minting the full
+ * 100,000,000 at genesis would leave ZERO headroom and make every single claim
+ * revert with `MintExceedsMaxSupply`.
  *
- *   team vesting        15,000,000 CATT  15.00% of MAX_SUPPLY  23.08% of genesis
- *   treasury            20,000,000 CATT  20.00% of MAX_SUPPLY  30.77% of genesis
- *   liquidity           30,000,000 CATT  30.00% of MAX_SUPPLY  46.15% of genesis
- *   ------------------------------------------------------
- *   genesis total       65,000,000 CATT  65.00% of MAX_SUPPLY 100.00% of genesis
- *   mining headroom     35,000,000 CATT  35.00% of MAX_SUPPLY  (never minted here)
- *
- * The three genesis buckets always sum to exactly INITIAL_SUPPLY, and
- * MAX_SUPPLY - INITIAL_SUPPLY is reserved as the mining emission budget.
- * Set INITIAL_SUPPLY to change the genesis size; the invariants (positive
- * liquidity bucket, strictly positive mining headroom, total <= MAX_SUPPLY) are
- * asserted before a single transaction is sent.
+ * The genesis total is DERIVED from the four bucket constants and then checked
+ * against the PRD's 60,000,000 at module load, so editing a bucket without
+ * updating the PRD total crashes the script immediately instead of silently
+ * deploying a different tokenomics. `INITIAL_SUPPLY` may only restate that
+ * derived total; it cannot redefine it.
  */
-const DEFAULT_INITIAL_SUPPLY_CATT = 65_000_000n;
 const TEAM_ALLOCATION_CATT = 15_000_000n;
 const TREASURY_ALLOCATION_CATT = 20_000_000n;
+const MARKETING_ALLOCATION_CATT = 15_000_000n;
+const DEX_LIQUIDITY_ALLOCATION_CATT = 10_000_000n;
+
+/** The PRD's genesis mint total, in whole CATT. Not configurable. */
+const EXPECTED_GENESIS_TOTAL_CATT = 60_000_000n;
+
+/** Sum of the four genesis buckets. This is what actually gets minted. */
+const GENESIS_TOTAL_CATT =
+  TEAM_ALLOCATION_CATT +
+  TREASURY_ALLOCATION_CATT +
+  MARKETING_ALLOCATION_CATT +
+  DEX_LIQUIDITY_ALLOCATION_CATT;
+
+// REAL CHECK, at module load, before a single transaction can be sent: the four
+// buckets must account for the PRD genesis total exactly.
+if (GENESIS_TOTAL_CATT !== EXPECTED_GENESIS_TOTAL_CATT) {
+  throw new Error(
+    "deploy-testnet.js: the four genesis buckets sum to " +
+      `${GENESIS_TOTAL_CATT} CATT but the PRD genesis mint is ${EXPECTED_GENESIS_TOTAL_CATT} CATT ` +
+      `(team ${TEAM_ALLOCATION_CATT} + treasury ${TREASURY_ALLOCATION_CATT} + ` +
+      `marketing ${MARKETING_ALLOCATION_CATT} + DEX liquidity ${DEX_LIQUIDITY_ALLOCATION_CATT}). ` +
+      "Refusing to deploy a tokenomics the PRD does not describe."
+  );
+}
+
+/** Genesis mint = the four buckets. Overridable only to restate this exact value. */
+const DEFAULT_INITIAL_SUPPLY_CATT = GENESIS_TOTAL_CATT;
 
 /** Polygon Amoy testnet chain id. */
 const DEFAULT_EXPECTED_CHAIN_ID = 80002n;
@@ -256,7 +299,7 @@ async function main() {
   /* 0. Configuration + fail-fast environment validation                      */
   /* ---------------------------------------------------------------------- */
 
-  const requiredEnvNames = ["SIGNER_ADDRESS", "TEAM_BENEFICIARY", "TREASURY_BENEFICIARY"];
+  const requiredEnvNames = ["SIGNER_ADDRESS", "TEAM_BENEFICIARY", "TREASURY_BENEFICIARY", "MARKETING_WALLET"];
   if (!isLocalRun) {
     requiredEnvNames.push("PRIVATE_KEY", "POLYGON_RPC_URL");
   }
@@ -278,6 +321,9 @@ async function main() {
         "  SIGNER_ADDRESS        backend Judge address -> MiningClaimer.signer",
         "  TEAM_BENEFICIARY      15,000,000 CATT vesting beneficiary",
         "  TREASURY_BENEFICIARY  20,000,000 CATT vesting beneficiary (must differ from TEAM_BENEFICIARY)",
+        "  MARKETING_WALLET      15,000,000 CATT marketing allocation. REQUIRED, no default: it is a",
+        "                         separate labelled bucket and must never silently land on the deployer",
+        "                         or be folded into the liquidity bucket.",
         "  YIELD_TOKEN_ADDRESS   real stablecoin for BondManager (omit with --mock-yield)",
         "",
         `Optional: LIQUIDITY_WALLET, INITIAL_SUPPLY, DEPLOYMENT_OUTPUT, EXPECTED_CHAIN_ID, MOCK_YIELD, POLYGONSCAN_API_KEY.`,
@@ -329,23 +375,54 @@ async function main() {
     );
   }
 
+  // Marketing is a separate, labelled bucket with its own destination. It is
+  // required (no default) precisely so it is never silently swept into the
+  // liquidity bucket or left sitting on the deployer.
+  if (!isAddress(env.MARKETING_WALLET)) {
+    fatal(
+      `MARKETING_WALLET is not a valid EVM address: ${JSON.stringify(env.MARKETING_WALLET)}`,
+      "It must be 0x followed by exactly 40 hex characters. The 15,000,000 CATT marketing\n" +
+        "allocation has NO default destination: it is a distinct bucket, not a slice of liquidity."
+    );
+  }
+  const marketingWallet = ethers.getAddress(env.MARKETING_WALLET);
+  if (marketingWallet === ethers.ZeroAddress) {
+    fatal("MARKETING_WALLET is the zero address.", "15,000,000 CATT would be burned at deployment.");
+  }
+
   const initialSupplyCatt = process.env.INITIAL_SUPPLY
     ? BigInt(String(process.env.INITIAL_SUPPLY).trim())
     : DEFAULT_INITIAL_SUPPLY_CATT;
   const teamAmount = TEAM_ALLOCATION_CATT * ONE;
   const treasuryAmount = TREASURY_ALLOCATION_CATT * ONE;
-  const liquidityAmountWei = initialSupplyCatt * ONE - teamAmount - treasuryAmount;
+  const marketingAmountWei = MARKETING_ALLOCATION_CATT * ONE;
+  const liquidityAmountWei = DEX_LIQUIDITY_ALLOCATION_CATT * ONE;
   const maxSupplyWei = MAX_SUPPLY_CATT * ONE;
-  const miningHeadroomWei = maxSupplyWei - initialSupplyCatt * ONE;
+  const genesisWei = initialSupplyCatt * ONE;
+  const miningHeadroomWei = maxSupplyWei - genesisWei;
 
   if (initialSupplyCatt <= 0n) {
     fatal(`INITIAL_SUPPLY must be positive, got ${initialSupplyCatt}.`);
   }
-  if (liquidityAmountWei <= 0n) {
+  // The genesis mint is DERIVED from the four buckets. INITIAL_SUPPLY may only
+  // restate that derived value; anything else is a different tokenomics and is
+  // refused rather than deployed.
+  const bucketSumWei = teamAmount + treasuryAmount + marketingAmountWei + liquidityAmountWei;
+  if (genesisWei !== bucketSumWei) {
     fatal(
-      `INITIAL_SUPPLY=${initialSupplyCatt} CATT leaves no liquidity allocation ` +
-        `(team ${TEAM_ALLOCATION_CATT} + treasury ${TREASURY_ALLOCATION_CATT} = ${TEAM_ALLOCATION_CATT + TREASURY_ALLOCATION_CATT} CATT is already committed).`,
-      `Use INITIAL_SUPPLY greater than ${TEAM_ALLOCATION_CATT + TREASURY_ALLOCATION_CATT}.`
+      `INITIAL_SUPPLY=${initialSupplyCatt} CATT does not equal the sum of the four PRD genesis buckets ` +
+        `(${formatCatt(bucketSumWei)} CATT: team ${TEAM_ALLOCATION_CATT} + treasury ${TREASURY_ALLOCATION_CATT} + ` +
+        `marketing ${MARKETING_ALLOCATION_CATT} + DEX liquidity ${DEX_LIQUIDITY_ALLOCATION_CATT}).`,
+      "The genesis mint is computed from the PRD allocation, not configured independently of it.\n" +
+        `Either unset INITIAL_SUPPLY (it defaults to ${formatCatt(bucketSumWei)}) or set it to exactly that value.`
+    );
+  }
+  if (initialSupplyCatt >= MAX_SUPPLY_CATT) {
+    fatal(
+      `INITIAL_SUPPLY=${initialSupplyCatt} CATT is at or above MAX_SUPPLY (${MAX_SUPPLY_CATT} CATT).`,
+      "MiningClaimer is the SOLE minter after transferOwnership and every mining reward mints on top of the\n" +
+        "genesis supply, so a genesis mint equal to MAX_SUPPLY leaves ZERO headroom and makes EVERY claim\n" +
+        "revert with MintExceedsMaxSupply."
     );
   }
   if (miningHeadroomWei <= 0n) {
@@ -356,6 +433,8 @@ async function main() {
         "with MintExceedsMaxSupply. Reduce INITIAL_SUPPLY."
     );
   }
+
+  const liquidityWalletEnv = env.LIQUIDITY_WALLET ? ethers.getAddress(env.LIQUIDITY_WALLET) : null;
 
   /* ---------------------------------------------------------------------- */
   /* 1. Signer                                                               */
@@ -370,6 +449,19 @@ async function main() {
   }
   const deployerAddress = await deployer.getAddress();
 
+  if (marketingWallet === deployerAddress) {
+    warn(
+      "MARKETING_WALLET is the deployer. The 15,000,000 CATT marketing allocation will sit on the deployer\n" +
+        "        wallet rather than on a marketing wallet. That is only acceptable for a throwaway local run."
+    );
+  }
+  if (liquidityWalletEnv && marketingWallet === liquidityWalletEnv) {
+    warn(
+      "MARKETING_WALLET equals LIQUIDITY_WALLET, so the marketing and DEX liquidity buckets land in one wallet.\n" +
+        "        They are separate allocations and should have separate destinations."
+    );
+  }
+
   if (!isLocalRun && deployerAddress.toLowerCase() !== String(env.PRIVATE_KEY || "").split(",")[0].trim().toLowerCase()) {
     // Not fatal (multi-key lists are allowed); just tell the operator who is really signing.
     warn(`the first signer on this network is ${deployerAddress}, which is not PRIVATE_KEY[0].`);
@@ -382,7 +474,8 @@ async function main() {
   log(`backend signer     : ${signerAddress}   (MiningClaimer.signer)`);
   log(`team beneficiary   : ${teamBeneficiary}   (${formatCatt(teamAmount)} CATT, vested)`);
   log(`treasury           : ${treasuryBeneficiary}   (${formatCatt(treasuryAmount)} CATT, vested)`);
-  log(`initial supply     : ${formatCatt(initialSupplyCatt * ONE)} CATT (${pct(initialSupplyCatt * ONE, maxSupplyWei)} of MAX_SUPPLY)`);
+  log(`marketing wallet   : ${marketingWallet}   (${formatCatt(marketingAmountWei)} CATT, marketing bucket)`);
+  log(`initial supply     : ${formatCatt(genesisWei)} CATT (${pct(genesisWei, maxSupplyWei)} of MAX_SUPPLY)`);
   log(`mining headroom    : ${formatCatt(miningHeadroomWei)} CATT (${pct(miningHeadroomWei, maxSupplyWei)} of MAX_SUPPLY)`);
 
   if (balanceWei === 0n) {
@@ -598,16 +691,19 @@ async function main() {
 
   const allocation = await catt.mint(deployerAddress, teamAmount);
   const treasuryMint = await catt.mint(treasuryBeneficiary, treasuryAmount);
+  const marketingMint = await catt.mint(marketingWallet, marketingAmountWei);
   const liquidityMint = await catt.mint(
-    env.LIQUIDITY_WALLET ? ethers.getAddress(env.LIQUIDITY_WALLET) : deployerAddress,
+    liquidityWalletEnv ? liquidityWalletEnv : deployerAddress,
     liquidityAmountWei
   );
   txs.mintTeam = allocation.hash;
   txs.mintTreasury = treasuryMint.hash;
+  txs.mintMarketing = marketingMint.hash;
   txs.mintLiquidity = liquidityMint.hash;
   log(`  mint team      -> deployer      ${formatCatt(teamAmount)} CATT          tx ${allocation.hash}`);
   log(`  mint treasury  -> ${treasuryBeneficiary} ${formatCatt(treasuryAmount)} CATT  tx ${treasuryMint.hash}`);
-  log(`  mint liquidity -> ${env.LIQUIDITY_WALLET ? ethers.getAddress(env.LIQUIDITY_WALLET) : deployerAddress} ${formatCatt(liquidityAmountWei)} CATT  tx ${liquidityMint.hash}`);
+  log(`  mint marketing -> ${marketingWallet} ${formatCatt(marketingAmountWei)} CATT  tx ${marketingMint.hash}`);
+  log(`  mint liquidity -> ${liquidityWalletEnv ? liquidityWalletEnv : deployerAddress} ${formatCatt(liquidityAmountWei)} CATT  tx ${liquidityMint.hash}`);
   if (!env.LIQUIDITY_WALLET) {
     warn("LIQUIDITY_WALLET is not set: the initial liquidity allocation is sitting on the DEPLOYER wallet. Set LIQUIDITY_WALLET before adding DEX liquidity.");
   }
@@ -641,7 +737,8 @@ async function main() {
   const stakingClaimer = await stakingManager.claimer();
   const vestingBalance = await catt.balanceOf(teamVestingAddress);
   const treasuryBalance = await catt.balanceOf(treasuryBeneficiary);
-  const liquidityWallet = env.LIQUIDITY_WALLET ? ethers.getAddress(env.LIQUIDITY_WALLET) : deployerAddress;
+  const marketingBalance = await catt.balanceOf(marketingWallet);
+  const liquidityWallet = liquidityWalletEnv ? liquidityWalletEnv : deployerAddress;
   const liquidityBalance = await catt.balanceOf(liquidityWallet);
   const totalSupply = await catt.totalSupply();
   const claimerSigner = await miningClaimer.signer();
@@ -674,16 +771,28 @@ async function main() {
       expected: `${formatCatt(treasuryAmount)} CATT`,
     },
     {
-      name: `liquidity wallet holds its ${formatCatt(liquidityAmountWei)} CATT`,
+      name: `marketing wallet holds its ${formatCatt(marketingAmountWei)} CATT (marketing bucket, not liquidity)`,
+      ok: marketingBalance === marketingAmountWei,
+      actual: `${formatCatt(marketingBalance)} CATT`,
+      expected: `${formatCatt(marketingAmountWei)} CATT`,
+    },
+    {
+      name: `DEX liquidity wallet holds its ${formatCatt(liquidityAmountWei)} CATT`,
       ok: liquidityBalance === liquidityAmountWei,
       actual: `${formatCatt(liquidityBalance)} CATT`,
       expected: `${formatCatt(liquidityAmountWei)} CATT`,
     },
     {
-      name: `totalSupply === minted ${formatCatt(initialSupplyCatt * ONE)} CATT`,
-      ok: totalSupply === initialSupplyCatt * ONE,
+      name: `four genesis buckets sum to the ${formatCatt(genesisWei)} CATT actually minted`,
+      ok: bucketSumWei === genesisWei && genesisWei === EXPECTED_GENESIS_TOTAL_CATT * ONE,
+      actual: `buckets ${formatCatt(bucketSumWei)} CATT / minted ${formatCatt(genesisWei)} CATT`,
+      expected: `${formatCatt(genesisWei)} CATT (PRD genesis ${EXPECTED_GENESIS_TOTAL_CATT} CATT)`,
+    },
+    {
+      name: `totalSupply === minted ${formatCatt(genesisWei)} CATT`,
+      ok: totalSupply === genesisWei,
       actual: `${formatCatt(totalSupply)} CATT`,
-      expected: `${formatCatt(initialSupplyCatt * ONE)} CATT`,
+      expected: `${formatCatt(genesisWei)} CATT`,
     },
     {
       name: `totalSupply <= MAX_SUPPLY (${formatCatt(maxSupplyWei)} CATT)`,
@@ -692,10 +801,10 @@ async function main() {
       expected: `<= ${formatCatt(maxSupplyWei)} CATT`,
     },
     {
-      name: "mining headroom > 0 (claims can still be minted)",
-      ok: miningHeadroomWei > 0n,
+      name: `mining headroom === MAX_SUPPLY - genesis = ${formatCatt(miningHeadroomWei)} CATT`,
+      ok: miningHeadroomWei === MAX_SUPPLY_CATT * ONE - EXPECTED_GENESIS_TOTAL_CATT * ONE && miningHeadroomWei > 0n,
       actual: `${formatCatt(miningHeadroomWei)} CATT`,
-      expected: "> 0 CATT",
+      expected: `${formatCatt(MAX_SUPPLY_CATT * ONE - EXPECTED_GENESIS_TOTAL_CATT * ONE)} CATT`,
     },
     {
       name: "miningClaimer.signer() === SIGNER_ADDRESS",
@@ -791,8 +900,8 @@ async function main() {
       note: yieldTokenNote,
     },
     initialAllocation: {
-      totalMinted: initialSupplyCatt * ONE,
-      totalMintedFormatted: `${formatCatt(initialSupplyCatt * ONE)} CATT`,
+      totalMinted: genesisWei,
+      totalMintedFormatted: `${formatCatt(genesisWei)} CATT`,
       maxSupply: maxSupplyWei,
       miningHeadroom: miningHeadroomWei,
       buckets: [
@@ -803,7 +912,7 @@ async function main() {
           amount: teamAmount,
           amountFormatted: `${formatCatt(teamAmount)} CATT`,
           percentOfMaxSupply: pct(teamAmount, maxSupplyWei),
-          percentOfGenesis: pct(teamAmount, initialSupplyCatt * ONE),
+          percentOfGenesis: pct(teamAmount, genesisWei),
           locked: true,
           tx: txs.mintTeam,
         },
@@ -814,18 +923,29 @@ async function main() {
           amount: treasuryAmount,
           amountFormatted: `${formatCatt(treasuryAmount)} CATT`,
           percentOfMaxSupply: pct(treasuryAmount, maxSupplyWei),
-          percentOfGenesis: pct(treasuryAmount, initialSupplyCatt * ONE),
+          percentOfGenesis: pct(treasuryAmount, genesisWei),
           locked: true,
           tx: txs.mintTreasury,
         },
         {
-          label: "liquidity",
+          label: "marketing",
+          recipient: marketingWallet,
+          beneficiary: marketingWallet,
+          amount: marketingAmountWei,
+          amountFormatted: `${formatCatt(marketingAmountWei)} CATT`,
+          percentOfMaxSupply: pct(marketingAmountWei, maxSupplyWei),
+          percentOfGenesis: pct(marketingAmountWei, genesisWei),
+          locked: false,
+          tx: txs.mintMarketing,
+        },
+        {
+          label: "dex liquidity",
           recipient: liquidityWallet,
           beneficiary: liquidityWallet,
           amount: liquidityAmountWei,
           amountFormatted: `${formatCatt(liquidityAmountWei)} CATT`,
           percentOfMaxSupply: pct(liquidityAmountWei, maxSupplyWei),
-          percentOfGenesis: pct(liquidityAmountWei, initialSupplyCatt * ONE),
+          percentOfGenesis: pct(liquidityAmountWei, genesisWei),
           locked: false,
           tx: txs.mintLiquidity,
         },
@@ -877,6 +997,7 @@ async function main() {
   log(row("backend signer", signerAddress));
   log(row("team beneficiary", `${teamBeneficiary} (vested)`));
   log(row("treasury beneficiary", `${treasuryBeneficiary} (vested)`));
+  log(row("marketing wallet", `${marketingWallet} (marketing bucket)`));
   log(row("liquidity wallet", liquidityWallet));
   log("");
   log("  INITIAL ALLOCATION (sums to 100% of what was minted)");
@@ -887,20 +1008,24 @@ async function main() {
   log(`  ${"-".repeat(74)}`);
   log(
     `  ${"team vesting".padEnd(20)}${formatCatt(teamAmount).padStart(20)}` +
-      `${pct(teamAmount, maxSupplyWei).padStart(18)}${pct(teamAmount, initialSupplyCatt * ONE).padStart(18)}`
+      `${pct(teamAmount, maxSupplyWei).padStart(18)}${pct(teamAmount, genesisWei).padStart(18)}`
   );
   log(
     `  ${"treasury".padEnd(20)}${formatCatt(treasuryAmount).padStart(20)}` +
-      `${pct(treasuryAmount, maxSupplyWei).padStart(18)}${pct(treasuryAmount, initialSupplyCatt * ONE).padStart(18)}`
+      `${pct(treasuryAmount, maxSupplyWei).padStart(18)}${pct(treasuryAmount, genesisWei).padStart(18)}`
   );
   log(
-    `  ${"liquidity".padEnd(20)}${formatCatt(liquidityAmountWei).padStart(20)}` +
-      `${pct(liquidityAmountWei, maxSupplyWei).padStart(18)}${pct(liquidityAmountWei, initialSupplyCatt * ONE).padStart(18)}`
+    `  ${"marketing".padEnd(20)}${formatCatt(marketingAmountWei).padStart(20)}` +
+      `${pct(marketingAmountWei, maxSupplyWei).padStart(18)}${pct(marketingAmountWei, genesisWei).padStart(18)}`
+  );
+  log(
+    `  ${"DEX liquidity".padEnd(20)}${formatCatt(liquidityAmountWei).padStart(20)}` +
+      `${pct(liquidityAmountWei, maxSupplyWei).padStart(18)}${pct(liquidityAmountWei, genesisWei).padStart(18)}`
   );
   log(`  ${"-".repeat(74)}`);
   log(
-    `  ${"TOTAL MINTED".padEnd(20)}${formatCatt(initialSupplyCatt * ONE).padStart(20)}` +
-      `${pct(initialSupplyCatt * ONE, maxSupplyWei).padStart(18)}${"100.00%".padStart(18)}`
+    `  ${"genesis total".padEnd(20)}${formatCatt(genesisWei).padStart(20)}` +
+      `${pct(genesisWei, maxSupplyWei).padStart(18)}${"100.00%".padStart(18)}`
   );
   log(
     `  ${"mining headroom".padEnd(20)}${formatCatt(miningHeadroomWei).padStart(20)}` +
