@@ -29,10 +29,31 @@
  * a returned layout (sorts its paragraphs, edits a quiz option) cannot
  * corrupt the seed or affect any other session.
  *
- * AMOUNTS: `reward` and `staminaCost` are decimal STRINGS of 18-decimal
- * CATT base units (1 CATT = 1e18), matching the on-chain uint256 types and
- * the `ClaimReward` struct in ../signer.js. Use `BigInt(x)` for arithmetic;
- * never rely on Number arithmetic (1e18 exceeds Number.MAX_SAFE_INTEGER).
+ * TWO UNITS, NEVER CONFLATED. This is the single most important thing to know
+ * about this file after the wave-9 stamina unit fix:
+ *
+ *   `reward`      a MONETARY amount: a decimal STRING of 18-decimal CATT base
+ *                 units (1 CATT = 1e18), matching the on-chain uint256 type and
+ *                 the `ClaimReward` struct in ../signer.js. Use `BigInt(x)` for
+ *                 arithmetic; never rely on Number arithmetic (1e18 exceeds
+ *                 Number.MAX_SAFE_INTEGER).
+ *
+ *   `staminaCost` a UNITLESS COUNT OF STAMINA POINTS, as a plain JS integer.
+ *                 `StakingManager.sol` states it directly: stamina "is unitless
+ *                 and has no monetary value" (see the NatSpec on the `stamina`
+ *                 mapping), `STAMINA_PER_STAKE = 50` stamina points are credited
+ *                 per successful stake, and `consumeStamina(account, amount)`
+ *                 reverts `StaminaInsufficient` unless `amount <= stamina[account]`.
+ *                 Declaring a stamina cost in wei made the cheapest mission cost
+ *                 `1e18 / 50 = 2e16` successful stakes to cover: no claim could
+ *                 ever settle and realised emission was 0. Stamina costs are
+ *                 therefore single-digit points, which is exactly the range where
+ *                 `Number.isSafeInteger` is lossless and a plain integer is the
+ *                 honest representation.
+ *
+ * Conflating the two is not a style question. A 1e18 "stamina cost" is not a
+ * large number of points, it is a number no account can ever hold; a stamina
+ * cost expressed as `"10"` is not ten wei, it is ten points.
  *
  * AUTHORING-TIME VALIDATION (the livelock guard): the seeded content is
  * validated at MODULE LOAD by `validateContent`, so a mission that could never
@@ -56,6 +77,13 @@
  *
  * Pure module: no I/O, no clock, no randomness, no environment access.
  */
+
+/**
+ * The one canonical definition of a business day. `dayKeyFor` below delegates
+ * to it rather than computing a date of its own, which is what guarantees there
+ * is exactly ONE rollover rule in the backend.
+ */
+const { wibDayKey } = require("./reset-schedule");
 
 const DIFFICULTIES = Object.freeze({
   EASY: "EASY",
@@ -115,7 +143,7 @@ const _ARTICLES_SEED = [
     title: "Why Your Attention Slips at Twenty-Three Minutes",
     difficulty: DIFFICULTIES.EASY,
     reward: "12000000000000000000", // 12 CATT
-    staminaCost: "1000000000000000000", // 1 CATT
+    staminaCost: 10, // 10 stamina POINTS (unitless), NOT 10 wei — see StakingManager.sol
     paragraphs: [
       "Most people believe attention behaves like a fuel tank: it empties, you refill it, and once it is empty there is nothing to do but wait. The research disagrees. Attention drifts long before the tank is empty, and the drift is not smooth. Instead it arrives in bursts — a few minutes of clean engagement, then a moment where your eyes have moved across the page without having read it, then a return. Once you notice that you have drifted, the previous paragraph is usually gone. Researchers call this a mind-wandering event, and the interesting part is that most of them are invisible from the inside until after the fact.",
       "The older explanation for this rhythm was the ultradian cycle, borrowed from sleep research: roughly ninety minutes of concentrated work, then a rest. Work on the twenty- to thirty-minute scale instead suggests a different mechanism. Under conditions of steady, self-paced reading, most readers begin to show measurable lapses in comprehension somewhere between fifteen and twenty-five minutes, with a median close to twenty-three. Crucially, the timing varies with the reader, the material and the environment — which is exactly why a fixed timer produces a fixed ceiling rather than a reliable signal.",
@@ -177,7 +205,7 @@ const _ARTICLES_SEED = [
     title: "The Spacing Effect: Why Cramming Lies to You",
     difficulty: DIFFICULTIES.MEDIUM,
     reward: "20000000000000000000", // 20 CATT
-    staminaCost: "2000000000000000000", // 2 CATT
+    staminaCost: 20, // 20 stamina POINTS (unitless), NOT 20 wei — see StakingManager.sol
     paragraphs: [
       "Cebiril's experiments with nonsense syllables are the oldest evidence in this story, and they are still the cleanest. He asked participants to learn lists of syllables and tested them at fixed intervals. Repeated testing always felt better and always scored worse than a single test after a longer delay, even though in the repeated condition each individual session was faster. The subjective report of a good study session and the objective report of later retention are simply different measurements, and only one of them is predictive of anything.",
       "The mechanism appears to be a failure of contextual retrieval rather than of memory itself. Each retrieval attempt succeeds partly because of cues present in that moment: the room, the time of day, the text two lines above, the mood you were in. Spaced retrieval removes those cues, so each attempt has to succeed on the strength of the material itself. That is the part you want. What feels like difficulty at the moment of practice is the diagnostic of an attempt that was not leaning on the room.",
@@ -239,7 +267,7 @@ const _ARTICLES_SEED = [
     title: "Desirable Difficulty and the Illusion of Fluency",
     difficulty: DIFFICULTIES.HARD,
     reward: "40000000000000000000", // 40 CATT (sponsored tier)
-    staminaCost: "3000000000000000000", // 3 CATT
+    staminaCost: 30, // 30 stamina POINTS (unitless), NOT 30 wei — see StakingManager.sol
     paragraphs: [
       "Learning scientists use difficulty as a design variable rather than a defect. During acquisition, conditions that make retrieval feel effortful — a delay before the cue, a partial cue rather than a full one, mixing problem types — reliably produce better long-run performance than conditions that feel clean. The word they use is desirable difficulty, and the qualifier matters: the difficulty has to be on the retrieval side. Adding difficulty to the presentation of material, or making the material itself more confusing, degrades learning reliably.",
       "Fluency is the reason this is hard to practise. When material is easy to process, comprehension feels immediate and real, and that feeling is produced by the ease of processing rather than by the quality of what was understood. A well-known demonstration has participants judge the font size of a passage, and then judge how likely they are to remember having read it: the smaller the font, the higher the remembered fluency, and the worse the actual later performance. Memory for the experience of understanding and memory for the content diverge completely under this manipulation.",
@@ -297,12 +325,13 @@ const _ARTICLES_SEED = [
 
 /**
  * The public bounty-board projection of the seed: one mission per article.
- * `reward` and `staminaCost` mirror the owning article exactly (the mission
- * is what the board displays, the article is what the reader gets), and the
- * difficulty ordering is the economy ordering — HARD/SPONSORED earns the most
- * and costs the most stamina.
+ * `reward` (an 18-decimal CATT decimal string) and `staminaCost` (a plain
+ * integer count of unitless stamina POINTS) mirror the owning article exactly
+ * — the mission is what the board displays, the article is what the reader gets
+ * — and the difficulty ordering is the economy ordering: HARD/SPONSORED earns
+ * the most and costs the most stamina.
  *
- * @type {ReadonlyArray<{ id: string, articleId: string, difficulty: string, reward: string, staminaCost: string }>}
+ * @type {ReadonlyArray<{ id: string, articleId: string, difficulty: string, reward: string, staminaCost: number }>}
  */
 const _MISSIONS_SEED = [
   {
@@ -310,21 +339,21 @@ const _MISSIONS_SEED = [
     articleId: "art-focus-101",
     difficulty: DIFFICULTIES.EASY,
     reward: "12000000000000000000", // 12 CATT
-    staminaCost: "1000000000000000000", // 1 CATT
+    staminaCost: 10, // 10 stamina POINTS (unitless), NOT 10 wei — see StakingManager.sol
   },
   {
     id: "mission-2",
     articleId: "art-focus-202",
     difficulty: DIFFICULTIES.MEDIUM,
     reward: "20000000000000000000", // 20 CATT
-    staminaCost: "2000000000000000000", // 2 CATT
+    staminaCost: 20, // 20 stamina POINTS (unitless), NOT 20 wei — see StakingManager.sol
   },
   {
     id: "mission-3",
     articleId: "art-focus-303",
     difficulty: DIFFICULTIES.HARD,
     reward: "40000000000000000000", // 40 CATT
-    staminaCost: "3000000000000000000", // 3 CATT
+    staminaCost: 30, // 30 stamina POINTS (unitless), NOT 30 wei — see StakingManager.sol
   },
 ];
 
@@ -460,6 +489,67 @@ function _describe(value) {
 }
 
 /**
+ * The largest stamina cost an author may declare, in unitless stamina points.
+ *
+ * A VALIDATION ceiling, not an economic parameter — see `_isPositiveStaminaCost`.
+ * It exists so that the wave-9 unit fix cannot be reintroduced silently: any
+ * value expressed in CATT base units (1e18 and up) is rejected at module load,
+ * with the same loud boot crash as any other poisoned content file.
+ *
+ * @type {number}
+ */
+const MAX_STAMINA_COST_POINTS = 1000000;
+
+/**
+ * True for a stamina cost that is a plain, plausible number of stamina POINTS.
+ *
+ * This is `_isPositiveAmount` AND a magnitude ceiling, and the second half is
+ * the point. `staminaCost > 0` is the wave-8 livelock guard and it catches the
+ * SIGN of the unit defect (a zero or negative cost reverts `ZeroAmount`). It
+ * cannot catch the MAGNITUDE: `"1000000000000000000"` is strictly positive, so
+ * the positivity guard passed it happily while the mission became permanently
+ * unclaimable — `consumeStamina` reverts `StaminaInsufficient` until the user
+ * has accumulated `1e18 / 50 = 2e16` successful stakes. That is the exact defect
+ * this file shipped until wave 9, and a positivity guard must never again be
+ * read as evidence that the unit is right.
+ *
+ * So the guard also refuses anything above `MAX_STAMINA_COST_POINTS`. This is a
+ * validation ceiling, NOT an economic parameter: it bounds what an AUTHOR may
+ * write, not what a USER may earn or spend, and no reward, split or multiplier
+ * is derived from it. `1e6` points is 33,333 seeded HARD missions in one go, so
+ * no plausible authored cost is excluded by it, while a CATT-denominated value
+ * (`1e18`) misses it by twelve orders of magnitude.
+ *
+ * @param {*} value Candidate stamina cost.
+ * @returns {boolean}
+ */
+function _isPositiveStaminaCost(value) {
+  if (!_isPositiveAmount(value)) return false;
+  const points = _staminaPointsOf(value);
+  // An unrepresentable magnitude (`points === null`) is a REJECT, never a pass:
+  // `null <= MAX` is `true` in JavaScript, which would let the exact
+  // CATT-denominated string this guard exists to catch straight through.
+  return points !== null && points <= MAX_STAMINA_COST_POINTS;
+}
+
+/**
+ * The point value of a positive stamina cost, or `null` when the value is not a
+ * plain integer quantity at all.
+ *
+ * @param {*} value Candidate stamina cost (number or decimal digit string).
+ * @returns {number|null}
+ */
+function _staminaPointsOf(value) {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? value : null;
+  if (typeof value === "bigint") return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : null;
+  if (typeof value === "string" && DECIMAL_PATTERN.test(value.trim())) {
+    const asBig = BigInt(value.trim());
+    return asBig <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(asBig) : null;
+  }
+  return null;
+}
+
+/**
  * Validates ONE mission.
  *
  * REQUIRED RULE — `staminaCost` must be a strictly positive integer amount.
@@ -519,12 +609,14 @@ function validateMission(mission, options) {
   }
 
   // REQUIRED: the livelock guard. First amount check, deliberately.
-  if (!_isPositiveAmount(mission.staminaCost)) {
+  if (!_isPositiveStaminaCost(mission.staminaCost)) {
     fail(
       "staminaCost",
-      `must be a strictly positive integer amount in 18-decimal base units, got ${_describe(
-        mission.staminaCost
-      )} — a zero or malformed stamina cost makes every claim revert on-chain with ZeroAmount`,
+      `must be a positive integer number of stamina POINTS in [1, ${MAX_STAMINA_COST_POINTS}] ` +
+        `(stamina is unitless — see StakingManager.sol; it is NOT a CATT amount), got ${_describe(
+          mission.staminaCost
+        )} — a zero or malformed stamina cost makes every claim revert on-chain with ` +
+        `ZeroAmount, and a CATT-denominated one reverts StaminaInsufficient forever`,
       mission.staminaCost
     );
   }
@@ -619,12 +711,13 @@ function validateArticle(article, options) {
       article.missionId
     );
   }
-  if (!_isPositiveAmount(article.staminaCost)) {
+  if (!_isPositiveStaminaCost(article.staminaCost)) {
     fail(
       "staminaCost",
-      `must be a strictly positive integer amount in 18-decimal base units, got ${_describe(
-        article.staminaCost
-      )} — the layout serves this amount and it becomes the signed claim`,
+      `must be a positive integer number of stamina POINTS in [1, ${MAX_STAMINA_COST_POINTS}] ` +
+        `(unitless, see StakingManager.sol — NOT an 18-decimal CATT amount), got ${_describe(
+          article.staminaCost
+        )} — the layout serves this amount and it becomes the signed claim`,
       article.missionId
     );
   }
@@ -762,6 +855,213 @@ function validateContent(content) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Stamina: the daily spend cap, the injectable policy, and the day key       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The per-user daily cap on stamina SPENT, in stamina POINTS.
+ *
+ * WHAT IT IS: a throttle on how much stamina one user may SPEND in one UTC day.
+ * It is deliberately NOT an on-chain parameter and NOT a confiscation:
+ *
+ *   - IT DOES NOT CONFISCATE ANYTHING. Stamina lives on-chain in
+ *     `StakingManager.stamina[account]`, and nothing in this backend can debit
+ *     a balance the user is not spending through a claim. The cap is admission
+ *     control in front of claims, not a clawback of a balance.
+ *   - UNSPENT STAMINA ROLLS OVER. Whatever a user does not spend today is still
+ *     theirs tomorrow, because the cap is re-derived from the per-DAY ledger
+ *     (`storage.js`'s `recordStaminaConsumption`) and never from a lifetime
+ *     total. There is no expiry to implement and no balance to burn.
+ *   - THEREFORE IT THROTTLES EMISSION, IT DOES NOT DESTROY A BALANCE. The
+ *     cheapest thing the cap can do is delay a claim by a day; the most it can
+ *     do is slow the burn-down of the mining headroom. That distinction is the
+ *     whole reason the mechanism is a per-day ledger rather than a mutable
+ *     balance: a cap that destroyed unspent stamina would be confiscation, and
+ *     this one is not.
+ *
+ * WHY 50, and why it is a NUMBER RATHER THAN A MODELLED SCHEDULE:
+ *   - It is exactly `STAMINA_PER_STAKE = 50` in `StakingManager.sol`: one
+ *     successful `stakeForStamina` buys one day of full-budget spending. The cap
+ *     is therefore self-explanatory against the one on-chain stamina constant
+ *     that exists, and needs no second invented constant to justify it.
+ *   - The mixed-average stamina cost of the seeded board is
+ *     `0.6 x 10 + 0.3 x 20 + 0.1 x 30 = 15` points, so `50 / 15 ~ 3.3` mixed
+ *     missions per day. A user who clears two HARD missions a day spends 60 and
+ *     is throttled on the third; a user doing three EASY missions spends 30 and
+ *     is not throttled at all.
+ *   - It is a THROTTLE CEILING, not a promise. Nothing here guarantees a user
+ *     can spend 50 a day; it only bounds what they may.
+ *
+ * WHAT THIS IS NOT: it is not an emission schedule, a reward, a multiplier or a
+ * season split. Those are economic parameters owned elsewhere, and none of them
+ * is set by this constant.
+ *
+ * @type {number}
+ */
+const DEFAULT_DAILY_STAMINA_CAP = 50;
+
+/**
+ * The PLAYER-FACING BUSINESS DAY an instant belongs to, as `YYYY-MM-DD`.
+ *
+ * !! BEHAVIOUR CHANGE (the "Genshin rule", 04:00 WIB) !!
+ * This used to be the UTC calendar day, rolling at 00:00 UTC. It is now the WIB
+ * business day, which rolls at 04:00 WIB = 21:00 UTC of the PREVIOUS UTC date.
+ * Between 21:00:00 UTC and 23:59:59 UTC the key therefore names TOMORROW's UTC
+ * date. Every caller still gets a `YYYY-MM-DD` string and still gets it from one
+ * definition — the shape of the API is unchanged, only the boundary moved — but
+ * any test, ledger reading or assertion that assumed a 00:00 UTC rollover must
+ * be re-read against the new rule. This is the founder's product decision, not
+ * an optimisation: a user playing at 23:55 WIB is still on the same business day
+ * they started on, so their streak and their stamina do not evaporate overnight.
+ *
+ * THE RULE, delegated, not reimplemented: the arithmetic lives in
+ * `reset-schedule.js#wibDayKey`, which is the single canonical definition of a
+ * business day for the whole backend. This function exists only to keep the
+ * `Date`/milliseconds calling convention that `server.js`, `stamina-allowance.js`
+ * and `seasons.js` already use, and to convert the unit at that one boundary
+ * (milliseconds here, epoch seconds in `reset-schedule.js`).
+ *
+ * WHY UTC-ANCHORED AND NOT HOST-LOCAL TIME: the day key is a storage key. If it
+ * were computed from the host's local timezone then the same instant would land
+ * in two different buckets depending on which machine ran the Judge, the ledger
+ * would fork across a redeploy, and a user could spend their cap twice by moving
+ * between two timezones. The WIB rule is applied as a FIXED UTC+7 offset (see
+ * `reset-schedule.js`'s header for why that is exact for this audience), never
+ * as a `Date`-local computation.
+ *
+ * WHY THE CALLER SUPPLIES `now`: this module reads no clock. It is a pure module
+ * — no I/O, no clock, no randomness, no environment — and an argument is the
+ * whole mechanism by which time enters it. A `dayKeyFor()` with no argument
+ * would put `Date.now()` back into a file whose header promises it is not there.
+ *
+ * @param {Date|number} now The instant, as a `Date` or epoch milliseconds.
+ * @returns {string} `YYYY-MM-DD`, the WIB business day.
+ * @throws {TypeError} If `now` is not a `Date` or a finite epoch-milliseconds
+ *   number.
+ */
+function dayKeyFor(now) {
+  if (now === null || now === undefined) {
+    throw new TypeError(
+      "dayKeyFor(now): `now` is required — the clock is injected, never read from inside " +
+        "this module."
+    );
+  }
+  const instant = now instanceof Date ? now : new Date(Number(now));
+  const time = instant.getTime();
+  if (!Number.isFinite(time)) {
+    throw new TypeError(
+      "dayKeyFor(now): `now` must be a Date or epoch milliseconds — the clock is injected, " +
+        "never read from inside this module."
+    );
+  }
+  // MILLISECONDS IN, EPOCH SECONDS OUT. The conversion is here, at the one
+  // boundary that speaks milliseconds, so `wibDayKey` can be strict about its
+  // unit instead of having to guess.
+  return wibDayKey(Math.floor(time / 1000));
+}
+
+/**
+ * Coerces a stamina POINT quantity to a plain non-negative integer.
+ *
+ * Accepts a safe-integer `number` or a decimal digit string (both are what the
+ * Judge produces), and rejects everything else: a negative value (the chain's
+ * `uint256` ABI encoder would reject it), a fraction (points are indivisible),
+ * `NaN`, `Infinity`, a boolean, `null`, `undefined`, an object.
+ *
+ * @param {*} value Candidate point quantity.
+ * @param {string} label Field name, for the error message.
+ * @returns {number} The integer value.
+ * @throws {TypeError} If `value` is not a non-negative integer quantity.
+ */
+function _points(value, label) {
+  let points = value;
+  if (typeof points === "string" && /^\d+$/.test(points.trim())) {
+    points = Number(points.trim());
+  }
+  if (typeof points !== "number" || !Number.isSafeInteger(points) || points < 0) {
+    throw new TypeError(
+      `${label} must be a non-negative integer number of stamina POINTS (unitless — see ` +
+        `StakingManager.sol), got ${_describe(value)}.`
+    );
+  }
+  return points;
+}
+
+/**
+ * Builds the injectable stamina-spend policy.
+ *
+ * This is a HOOK, not a decision. `cap` is a parameter, `cap: null` disables the
+ * throttle entirely, and no call site inside this module reads the cap: the
+ * returned object is a pure function of what the caller already knows (the day's
+ * consumed total and the amount about to be spent), so it can be exercised in a
+ * test without a store, a clock or a chain.
+ *
+ * The policy NEVER holds state. It is `Object.freeze`d, it accumulates nothing,
+ * and two calls with the same arguments always return the same answer — which is
+ * what makes it safe to construct one per request and share it across users.
+ *
+ * @param {Object} [options]
+ * @param {number|null} [options.cap] Daily cap in stamina points, or `null` to
+ *   disable the throttle. Defaults to {@link DEFAULT_DAILY_STAMINA_CAP}.
+ * @returns {Readonly<{
+ *   cap: number|null,
+ *   enabled: boolean,
+ *   remaining: ({ consumed: number }) => number|null,
+ *   admits: ({ consumed: number, amount: number }) => Readonly<Object>,
+ * }>} A frozen policy object.
+ * @throws {TypeError} If `cap` is neither `null` nor a non-negative integer.
+ */
+function createStaminaPolicy({ cap = DEFAULT_DAILY_STAMINA_CAP } = {}) {
+  const resolved = cap === null || cap === undefined ? null : _points(cap, "cap");
+
+  return Object.freeze({
+    /** The daily cap in points, or `null` when the throttle is disabled. */
+    cap: resolved,
+    /** True when a cap is in force. */
+    enabled: resolved !== null,
+
+    /**
+     * Points still spendable today.
+     *
+     * @param {{ consumed: number }} state The day's consumed total so far.
+     * @returns {number|null} The remaining allowance (never negative), or `null`
+     *   when the throttle is disabled and there is therefore no allowance to
+     *   speak of.
+     */
+    remaining({ consumed }) {
+      if (resolved === null) return null;
+      const spent = _points(consumed, "consumed");
+      return Math.max(0, resolved - spent);
+    },
+
+    /**
+     * The single question a caller needs answered: may this claim go through?
+     *
+     * @param {{ consumed: number, amount: number }} state The day's consumed
+     *   total and the points this claim would spend.
+     * @returns {Readonly<{ allowed: boolean, cap: number|null, consumed: number,
+     *   amount: number, remaining: number|null }>} The decision plus the numbers
+     *   that produced it, so a rejection can be explained rather than guessed.
+     */
+    admits({ consumed, amount }) {
+      const spent = _points(consumed, "consumed");
+      const want = _points(amount, "amount");
+      if (resolved === null) {
+        return Object.freeze({ allowed: true, cap: null, consumed: spent, amount: want, remaining: null });
+      }
+      const left = Math.max(0, resolved - spent);
+      return Object.freeze({
+        allowed: want <= left,
+        cap: resolved,
+        consumed: spent,
+        amount: want,
+        remaining: left,
+      });
+    },
+  });
+}
+
+/* -------------------------------------------------------------------------- */
 /* Seeded PRNG (the reproducibility contract)                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -870,7 +1170,7 @@ validateContent({ missions: MISSIONS, articles: ARTICLES });
  * Lists the bounty board. Returns a deep copy so the caller can filter/sort
  * the result freely without any possibility of mutating the seed.
  *
- * @returns {Array<{ id: string, articleId: string, difficulty: string, reward: string, staminaCost: string }>}
+ * @returns {Array<{ id: string, articleId: string, difficulty: string, reward: string, staminaCost: number }>}
  *   Fresh mission objects, in board order.
  */
 function listMissions() {
@@ -881,7 +1181,7 @@ function listMissions() {
  * Looks up a single mission (bounty-board projection).
  *
  * @param {string} missionId
- * @returns {{ id: string, articleId: string, difficulty: string, reward: string, staminaCost: string }|undefined}
+ * @returns {{ id: string, articleId: string, difficulty: string, reward: string, staminaCost: number }|undefined}
  *   A defensive copy, or `undefined` when the id is unknown.
  */
 function getMission(missionId) {
@@ -918,7 +1218,7 @@ function getArticle(articleId) {
  * @param {string} sessionId Caller's session id; seeds the PRNG.
  * @returns {{
  *   id: string, missionId: string, title: string, difficulty: string,
- *   reward: string, staminaCost: string,
+ *   reward: string, staminaCost: number,
  *   paragraphs: Array<string>,
  *   focusTrap: { index: number, type: "swipe-to-continue"|"tap-the-image"|"hold-to-reveal" },
  *   quiz: Array<Object>,
@@ -977,6 +1277,11 @@ module.exports = {
   getMission,
   getArticle,
   getArticleLayout,
+  // Stamina: the daily SPEND cap, the injectable policy hook, and the UTC day key.
+  DEFAULT_DAILY_STAMINA_CAP,
+  MAX_STAMINA_COST_POINTS,
+  createStaminaPolicy,
+  dayKeyFor,
   // Authoring-time validation (the livelock guard).
   validateContent,
   validateMission,

@@ -79,7 +79,10 @@ function signedClaim(overrides = {}, signingWallet = judgeWallet) {
   const claim = {
     user: USER_A,
     reward: MISSION.reward,
-    staminaCost: MISSION.staminaCost,
+    // The WIRE form. `MISSION.staminaCost` is a plain integer count of unitless
+    // stamina POINTS (StakingManager.sol); a claim payload is decimal text, which
+    // is exactly what `toUintString` produces for it on the way out.
+    staminaCost: String(MISSION.staminaCost),
     nonce: "1",
     deadline: String(Math.floor(Date.now() / 1000) + 600),
     ...overrides,

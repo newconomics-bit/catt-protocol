@@ -6,7 +6,7 @@
   "main": "signer.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test test/content.test.js test/anticheat.test.js test/server.test.js test/sqlite-store.test.js test/persistence.test.js",
+    "test": "node --test",
     "sign:smoke": "node -e \"const s=require('./signer');console.log(Object.keys(s).join(','))\""
   },
   "dependencies": {

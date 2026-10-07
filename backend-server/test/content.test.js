@@ -73,8 +73,15 @@ test("bounty board: three missions are listed in order with the projected fields
     );
     assert.equal(typeof mission.id, "string");
     assert.ok(["EASY", "MEDIUM", "HARD"].includes(mission.difficulty));
-    assert.match(mission.reward, /^\d+$/);
-    assert.match(mission.staminaCost, /^\d+$/);
+    assert.match(mission.reward, /^\d+$/, "reward is an 18-decimal CATT decimal STRING");
+    // Stamina is UNITLESS POINTS (StakingManager.sol), so it is a plain safe
+    // integer and NOT a decimal string: a 1e18 "stamina cost" is a CATT amount
+    // wearing a stamina label, and the cheapest mission would cost 2e16 stakes.
+    assert.ok(
+      Number.isSafeInteger(mission.staminaCost) && mission.staminaCost > 0,
+      `${mission.id}: staminaCost ${String(mission.staminaCost)} must be a positive safe integer of POINTS`
+    );
+    assert.ok(mission.staminaCost <= 1000, `${mission.id}: points, not base units`);
   }
   assert.deepEqual(
     missions.map((m) => m.id),
@@ -197,7 +204,7 @@ test("layout shape: metadata, shuffled paragraphs, one trap, authored quiz order
   assert.equal(layout.missionId, "mission-1");
   assert.equal(layout.difficulty, "EASY");
   assert.equal(layout.reward, "12000000000000000000");
-  assert.equal(layout.staminaCost, "1000000000000000000");
+  assert.equal(layout.staminaCost, 10);
   assert.equal(typeof layout.title, "string");
   assert.ok(Array.isArray(layout.paragraphs));
   assert.deepEqual(

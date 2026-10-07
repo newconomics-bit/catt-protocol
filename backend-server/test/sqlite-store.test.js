@@ -214,6 +214,66 @@ test("parity: memory and sqlite agree on the same scripted sequence", async () =
 
     log.telemetry = await store.getTelemetry("s-1");
     log.telemetryUnknown = await store.getTelemetry("s-never-existed");
+
+    /* --- the growth ledgers ------------------------------------------- */
+    // Driven through the SAME script as everything above, because "the two
+    // adapters return identical views" is a claim about the whole interface and
+    // not about the parts that existed when it was first written. The full
+    // behavioural specification of these methods is in test/growth-store.test.js;
+    // this is the drop-in guarantee.
+    log.staminaEmpty = await store.getStaminaConsumed({ userAddress: USER_A, dayKey: "2026-09-01" });
+    log.staminaOne = await store.recordStaminaConsumption({ userAddress: USER_A, dayKey: "2026-09-01", amount: 10 });
+    log.staminaTwo = await store.recordStaminaConsumption({ userAddress: USER_A, dayKey: "2026-09-01", amount: 20 });
+    log.staminaOtherDay = await store.recordStaminaConsumption({ userAddress: USER_A, dayKey: "2026-09-02", amount: BIG_REWARD });
+    log.staminaRead = await store.getStaminaConsumed({ userAddress: USER_A, dayKey: "2026-09-01" });
+    log.staminaHuge = await store.recordStaminaConsumption({ userAddress: USER_B, dayKey: "2026-09-01", amount: "9007199254740993" });
+
+    log.streakNone = await store.getStreak({ userAddress: USER_C });
+    log.streakFirst = await store.recordGradedCompletion({ userAddress: USER_A, dayKey: "2026-09-01", reward: BIG_REWARD, missionId: "mission-1" });
+    log.streakSameDay = await store.recordGradedCompletion({ userAddress: USER_A, dayKey: "2026-09-01", missionId: "mission-3" });
+    log.streakNextDay = await store.recordGradedCompletion({ userAddress: USER_A, dayKey: "2026-09-02" });
+    log.streakGap = await store.recordGradedCompletion({ userAddress: USER_A, dayKey: "2026-09-09" });
+    log.streakRetro = await store.recordGradedCompletion({ userAddress: USER_A, dayKey: "2026-09-07" });
+    log.streakRead = await store.getStreak({ userAddress: USER_A });
+
+    log.freeEmpty = await store.getFreeStaminaGranted({ userAddress: USER_A, dayKey: "2026-09-01" });
+    log.freeDay1 = await store.recordFreeStaminaGrant({ userAddress: USER_A, dayKey: "2026-09-01", amount: 25 });
+    log.freeDay1Again = await store.recordFreeStaminaGrant({ userAddress: USER_A, dayKey: "2026-09-01", amount: 25 });
+    log.freeDay2 = await store.getFreeStaminaGranted({ userAddress: USER_A, dayKey: "2026-09-02" });
+
+    log.seasonMissing = await store.getSeason("season-never-created");
+    log.seasonSaved = await store.saveSeason({ id: "s1", start: 100, end: 200, allocation: BIG_REWARD, claimMode: "pro-rata" });
+    // An OPEN-ENDED season (`end: null`), deliberately placed so it does NOT
+    // overlap `s1`: the boundary semantics stay readable, and the overlap rule is
+    // pinned separately in test/growth-store.test.js.
+    log.seasonOpen = await store.saveSeason({ id: "s-open", start: 300, end: null, allocation: "5", claimMode: "flat" });
+    log.seasonUpdated = await store.saveSeason({ id: "s1", start: 100, end: 250, allocation: BIG_REWARD, claimMode: "pro-rata" });
+    log.seasonRead = await store.getSeason("s1");
+    // The window is [start, end). `s1` was extended from 200 to 250 by the
+    // upsert above, so 199 is inside it and 250 is the first instant outside it.
+    log.activeBefore = await store.getActiveSeason(99);
+    log.activeStart = await store.getActiveSeason(100);
+    log.activeBeforeEnd = await store.getActiveSeason(199);
+    log.activeAtEnd = await store.getActiveSeason(250);
+    log.activeBeforeOpen = await store.getActiveSeason(299);
+    log.activeOpenStart = await store.getActiveSeason(300);
+    log.activeFar = await store.getActiveSeason(99999);
+
+    log.claimUnused = await store.isSeasonClaimUsed({ seasonId: "s1", userAddress: USER_A, nonce: 1 });
+    log.claimRecorded = await store.recordSeasonClaim({ seasonId: "s1", userAddress: USER_A, amount: BIG_REWARD, nonce: 1 });
+    log.claimUsed = await store.isSeasonClaimUsed({ seasonId: "s1", userAddress: USER_A, nonce: 1 });
+    log.claimOther = await store.recordSeasonClaim({ seasonId: "s1", userAddress: USER_B, amount: "7", nonce: 1 });
+    log.seasonTotal = await store.getSeasonClaimedTotal("s1");
+    log.userAccruedA = await store.getSeasonUserAccrued({ seasonId: "s1", userAddress: USER_A });
+    log.userAccruedB = await store.getSeasonUserAccrued({ seasonId: "s1", userAddress: USER_B });
+    log.seasonTotalOpen = await store.getSeasonClaimedTotal("s-open");
+
+    log.minersDay1 = await store.countActiveMiners({ dayKey: "2026-09-01" });
+    log.minersDay2 = await store.countActiveMiners({ dayKey: "2026-09-02" });
+    log.minersDay3 = await store.countActiveMiners({ dayKey: "2026-09-03" });
+    log.minersDay9 = await store.countActiveMiners({ dayKey: "2026-09-09" });
+    log.minersMixed = await store.countActiveMiners({ dayKey: "2026-09-10" });
+
     return log;
   }
 
@@ -282,6 +342,36 @@ test("parity: memory and sqlite agree on the same scripted sequence", async () =
   assert.deepEqual(b.markSecond, false);
   assert.equal(b.claimRelayed.relayerTxHash, TX_A, "the winning relay hash must never be overwritten");
 
+  // Growth-ledger spot-checks, so a parity failure names the behaviour that broke.
+  assert.deepEqual(b.staminaEmpty.consumed, "0");
+  assert.deepEqual(b.staminaTwo.consumed, "30", "the stamina ledger accumulates");
+  assert.deepEqual(b.staminaRead.consumed, "30", "and does not bleed into another day");
+  assert.deepEqual(b.staminaOtherDay.consumed, BIG_REWARD, "a 1e24 amount is exact, not rounded");
+  assert.deepEqual(b.staminaHuge.consumed, "9007199254740993", "a value above 2^53 is exact");
+  assert.deepEqual(
+    [b.streakFirst.current, b.streakSameDay.current, b.streakNextDay.current, b.streakGap.current, b.streakRetro.current],
+    [1, 1, 2, 1, 1],
+    "the four streak cases"
+  );
+  assert.deepEqual(b.streakRead, { userAddress: USER_A, current: 1, lastGradedDay: "2026-09-07" });
+  assert.deepEqual(b.freeDay1Again.granted, "50");
+  assert.deepEqual(b.freeDay2.granted, "0", "a day-A grant never leaks into day B");
+  assert.deepEqual(b.seasonOpen.end, null, "an open-ended season round-trips as null");
+  assert.deepEqual(b.activeBefore, undefined);
+  assert.deepEqual(b.activeStart.id, "s1", "the window is start-inclusive");
+  assert.deepEqual(b.activeBeforeEnd.id, "s1");
+  assert.deepEqual(b.activeAtEnd, undefined, "`end` is EXCLUSIVE, so back-to-back windows are well defined");
+  assert.deepEqual(b.activeBeforeOpen, undefined, "and there is a real gap before the next season");
+  assert.deepEqual(b.activeOpenStart.id, "s-open", "an open-ended season starts inclusively");
+  assert.deepEqual(b.activeFar.id, "s-open", "and owns everything from its start onward");
+  assert.deepEqual([b.claimUnused, b.claimUsed], [false, true], "isSeasonClaimUsed flips");
+  assert.deepEqual(b.claimRecorded, { seasonClaimedTotal: BIG_REWARD, userAccrued: BIG_REWARD });
+  assert.deepEqual(b.seasonTotal, (BigInt(BIG_REWARD) + 7n).toString());
+  assert.deepEqual(b.userAccruedA, BIG_REWARD);
+  assert.deepEqual(b.userAccruedB, "7");
+  assert.deepEqual(b.seasonTotalOpen, "0", "seasons do not share a total");
+  assert.deepEqual([b.minersDay1, b.minersDay2, b.minersDay3, b.minersDay9, b.minersMixed], [1, 1, 0, 1, 0]);
+
   await sqlite.close();
   await sqlite.dispose();
 });
@@ -293,7 +383,25 @@ test("parity: memory and sqlite agree on the same scripted sequence", async () =
 test("schema: user_version records the schema version a future migration bumps", async () => {
   const { store, filename } = await openStore();
   assert.equal(store._schemaVersion(), SCHEMA_VERSION);
-  assert.equal(SCHEMA_VERSION, 1);
+  // DE-BRITTLED (was `SCHEMA_VERSION === 3`): the expectation is derived from
+  // MIGRATIONS instead of being written as a literal, so the next wave appending
+  // a migration does not have to edit this test to keep it green — the test that
+  // matters is "the file is stamped with the last migration's version", which is
+  // asserted below and is what actually breaks if the bump is forgotten.
+  assert.equal(
+    SCHEMA_VERSION,
+    MIGRATIONS[MIGRATIONS.length - 1].version,
+    "SCHEMA_VERSION must equal the last migration's version"
+  );
+  assert.deepEqual(
+    MIGRATIONS.map((m) => m.version),
+    Array.from({ length: SCHEMA_VERSION }, (_, index) => index + 1),
+    "migrations must be exactly 1..SCHEMA_VERSION: append-only, contiguous, never edited"
+  );
+  assert.ok(
+    MIGRATIONS.some((m) => /governor_daily_spend/.test(m.up.toString())),
+    "the daily governor budget ledger must ship as one of the migrations"
+  );
   assert.equal(
     MIGRATIONS[MIGRATIONS.length - 1].version,
     SCHEMA_VERSION,
@@ -451,6 +559,12 @@ test("fidelity: a reward far above 2^53 round-trips exactly", async () => {
     sessionId: "s-1",
     digest: "0x" + "aa".repeat(32),
     reward: BIG_REWARD, // 1e24: also far above SQLite's signed 64-bit INTEGER
+    // NOT a seeded mission cost: this is a deliberate TEXT-CAPACITY probe, so it
+    // stays in the 1e18 range on purpose. The seeded costs are unitless stamina
+    // POINTS (10/20/30, see content.js); this value exists to prove the
+    // stamina_cost column round-trips a value an INTEGER could not hold, and
+    // `assert.equal(claim.staminaCost, "3000000000000000000")` below is that
+    // proof. The seeded unit values are pinned in test/growth-store.test.js.
     staminaCost: "3000000000000000000",
     deadline: HUGE_DEADLINE,
     signature: "0x" + "bb".repeat(65),
@@ -488,6 +602,196 @@ test("fidelity: a reward far above 2^53 round-trips exactly", async () => {
   });
   const mirrored = store._raw().prepare("SELECT reward_json, stamina_cost_json FROM submissions").get();
   assert.equal(mirrored.reward_json, BIG_REWARD);
+  await store.close();
+});
+
+test("uniqueness: every growth table refuses a raw duplicate INSERT in the SCHEMA", async () => {
+  const { store } = await openStore();
+  const db = store._raw();
+
+  /* --- the rows a caller writes through the adapter ---------------------- */
+  await store.recordStaminaConsumption({ userAddress: USER_A, dayKey: "2026-01-01", amount: 10 });
+  await store.recordGradedCompletion({ userAddress: USER_A, dayKey: "2026-01-01", missionId: "mission-1" });
+  await store.recordFreeStaminaGrant({ userAddress: USER_A, dayKey: "2026-01-01", amount: 25 });
+  await store.saveSeason({ id: "s1", start: 100, end: 200, allocation: BIG_REWARD, claimMode: "pro-rata" });
+  await store.recordSeasonClaim({ seasonId: "s1", userAddress: USER_A, amount: BIG_REWARD, nonce: 5 });
+  await store.recordGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01", amount: BIG_REWARD });
+
+  /* --- and now the same rows again, in RAW SQL --------------------------- */
+  // Bypassing every line of JavaScript: each of these must be refused by SQLite
+  // itself, because the table's key IS its primary key. A JS check would be one
+  // refactor away from being skipped, and the property being defended — one row
+  // per (user, day) / per user / per season id / per (season, user, nonce) — is
+  // a property of the DATA.
+  assert.throws(
+    () =>
+      db
+        .prepare("INSERT INTO stamina_ledger (user_address, day_key, consumed, updated_at) VALUES (?, ?, '1', 1)")
+        .run(USER_A.toLowerCase(), "2026-01-01"),
+    /UNIQUE constraint failed: stamina_ledger\.user_address, stamina_ledger\.day_key/
+  );
+  assert.throws(
+    () => db.prepare("INSERT INTO streaks (user_address, current_streak, last_graded_day) VALUES (?, 99, '2026-01-01')").run(USER_A.toLowerCase()),
+    /UNIQUE constraint failed: streaks\.user_address/
+  );
+  assert.throws(
+    () =>
+      db
+        .prepare("INSERT INTO daily_active_miners (day_key, user_address) VALUES (?, ?)")
+        .run("2026-01-01", USER_A.toLowerCase()),
+    /UNIQUE constraint failed: daily_active_miners\.day_key, daily_active_miners\.user_address/
+  );
+  assert.throws(
+    () =>
+      db
+        .prepare("INSERT INTO free_stamina_grants (user_address, day_key, granted, updated_at) VALUES (?, ?, '1', 1)")
+        .run(USER_A.toLowerCase(), "2026-01-01"),
+    /UNIQUE constraint failed: free_stamina_grants\.user_address, free_stamina_grants\.day_key/
+  );
+  assert.throws(
+    () => db.prepare("INSERT INTO seasons (id, start_at, end_at, allocation, claim_mode) VALUES (?, 1, 2, '1', 'x')").run("s1"),
+    /UNIQUE constraint failed: seasons\.id/
+  );
+  assert.throws(
+    () =>
+      db
+        .prepare(
+          "INSERT INTO season_claims (season_id, user_address, nonce, amount, claimed_at) VALUES (?, ?, ?, '1', 1)"
+        )
+        .run("s1", USER_A.toLowerCase(), "5"),
+    /UNIQUE constraint failed: season_claims\.season_id, season_claims\.user_address, season_claims\.nonce/
+  );
+  assert.throws(
+    () =>
+      db
+        .prepare("INSERT INTO governor_daily_spend (season_id, day_key, spent, updated_at) VALUES (?, ?, '1', 1)")
+        .run("s1", "2026-01-01"),
+    /UNIQUE constraint failed: governor_daily_spend\.season_id, governor_daily_spend\.day_key/
+  );
+
+  // THE FOREIGN KEY. A spend against a season that does not exist reconciles
+  // against nothing and cannot be scaled or audited, so the DATABASE refuses it
+  // with raw SQL — no line of application code is involved in this insert.
+  assert.throws(
+    () =>
+      db
+        .prepare("INSERT INTO governor_daily_spend (season_id, day_key, spent, updated_at) VALUES (?, ?, '1', 1)")
+        .run("s-never-created", "2026-01-01"),
+    /FOREIGN KEY constraint failed/
+  );
+  // And through the adapter itself, which refuses an unknown season on read and
+  // on write (the SQLite side additionally re-checks the FK in the database).
+  await assert.rejects(() => store.getGovernorSpend({ seasonId: "s-never-created", dayKey: "2026-01-01" }), /unknown season/);
+  await assert.rejects(
+    () => store.recordGovernorSpend({ seasonId: "s-never-created", dayKey: "2026-01-01", amount: "1" }),
+    /unknown season/
+  );
+  await assert.rejects(() => store.getGovernorSpendTotal({ seasonId: "s-never-created" }), /unknown season/);
+
+  // And the originals are intact: a refused duplicate changes nothing.
+  assert.equal((await store.getStaminaConsumed({ userAddress: USER_A, dayKey: "2026-01-01" })).consumed, "10");
+  assert.equal((await store.getStreak({ userAddress: USER_A })).current, 1);
+  assert.equal((await store.getFreeStaminaGranted({ userAddress: USER_A, dayKey: "2026-01-01" })).granted, "25");
+  assert.equal((await store.getSeasonClaimedTotal("s1")), BIG_REWARD);
+  assert.equal(await store.countActiveMiners({ dayKey: "2026-01-01" }), 1);
+  assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), BIG_REWARD);
+  assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), BIG_REWARD);
+
+  // A DIFFERENT day is a different row, not a duplicate — the property the daily
+  // stamina cap, the free-grant ledger AND the governor's daily budget all depend
+  // on: a new business day is a new bucket that starts at zero, and yesterday's
+  // spend can never be read as today's.
+  db.prepare("INSERT INTO stamina_ledger (user_address, day_key, consumed, updated_at) VALUES (?, '2026-01-02', '7', 1)").run(
+    USER_A.toLowerCase()
+  );
+  assert.equal((await store.getStaminaConsumed({ userAddress: USER_A, dayKey: "2026-01-02" })).consumed, "7");
+  db.prepare("INSERT INTO governor_daily_spend (season_id, day_key, spent, updated_at) VALUES ('s1', '2026-01-02', '7', 1)").run();
+  assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-02" }), "7");
+  assert.equal(await store.getGovernorSpend({ seasonId: "s1", dayKey: "2026-01-01" }), BIG_REWARD, "day one is untouched");
+  assert.equal(await store.getGovernorSpendTotal({ seasonId: "s1" }), (BigInt(BIG_REWARD) + 7n).toString());
+
+  // The governor ledger and the season claimed total are DIFFERENT QUANTITIES:
+  // the same 1e24 sits in both here only because both were written, and the
+  // governor's per-day row has no user and no nonce to be a claim record.
+  assert.equal(
+    store._raw().prepare("SELECT COUNT(*) AS n FROM governor_daily_spend").get().n,
+    2,
+    "exactly one row per (season, day): the upsert path never leaves a duplicate"
+  );
+
+  // SQLite does NOT imply NOT NULL from a TEXT PRIMARY KEY, so a NULL address is
+  // refused explicitly rather than letting every NULL user share one bucket.
+  assert.throws(
+    () => db.prepare("INSERT INTO streaks (user_address, current_streak) VALUES (NULL, 1)").run(),
+    /NOT NULL/
+  );
+  await store.close();
+});
+
+test("schema: the growth migrations are additive, idempotent and applied in order", async () => {
+  const filename = tempDbPath("migrations");
+  const store = createSqliteStore({ filename });
+
+  // DE-BRITTLED (was `MIGRATIONS.map((m) => m.version)` deepEqual `[1, 2, 3]`):
+  // derived from SCHEMA_VERSION, so appending migration 4 (and the one after
+  // that) does not turn this into a failure that has to be edited by hand.
+  assert.deepEqual(
+    MIGRATIONS.map((m) => m.version),
+    Array.from({ length: SCHEMA_VERSION }, (_, index) => index + 1),
+    "migrations are append-only: one per version, no gaps, no rewrites"
+  );
+  assert.equal(MIGRATIONS[MIGRATIONS.length - 1].version, SCHEMA_VERSION);
+  // Never edit a shipped migration: re-running one must be a no-op, which is
+  // what `IF NOT EXISTS` everywhere buys.
+  const ddl = MIGRATIONS.map((m) => m.up.toString()).join("\n");
+  for (const statement of ["CREATE TABLE IF NOT EXISTS", "CREATE INDEX IF NOT EXISTS"]) {
+    assert.ok(ddl.includes(statement), `every DDL statement must be guarded by ${statement}`);
+  }
+  // No migration may drop or rewrite a shipped table.
+  assert.equal(/DROP\s+TABLE/i.test(ddl), false);
+  assert.equal(/ALTER\s+TABLE/i.test(ddl), false, "additive only: no column is added to or changed on an existing table");
+
+  // Every table the growth methods read actually exists.
+  const tables = store
+    ._raw()
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+    .all()
+    .map((row) => row.name);
+  for (const name of [
+    "stamina_ledger",
+    "streaks",
+    "daily_active_miners",
+    "free_stamina_grants",
+    "seasons",
+    "season_claims",
+    "governor_daily_spend",
+  ]) {
+    assert.ok(tables.includes(name), `missing table: ${name}`);
+  }
+
+  // countActiveMiners must not table-scan: its day lookup is index-served.
+  const plan = store._raw().prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM daily_active_miners WHERE day_key = ?").all("2026-01-01");
+  assert.match(JSON.stringify(plan), /daily_active_miners_day/, "the day filter must be served by an index");
+
+  // The governor's per-day read must likewise be the (season_id, day_key) primary
+  // key and not a scan of every season's every day.
+  const governorPlan = store
+    ._raw()
+    .prepare("EXPLAIN QUERY PLAN SELECT spent FROM governor_daily_spend WHERE season_id = ? AND day_key = ?")
+    .all("s1", "2026-01-01");
+  assert.match(
+    JSON.stringify(governorPlan),
+    /sqlite_autoindex_governor_daily_spend/,
+    "the (season, day) lookup must be served by the composite primary key index"
+  );
+  assert.equal(/SCAN governor_daily_spend/.test(JSON.stringify(governorPlan)), false, "and must never table-scan");
+
+  // Re-opening is idempotent: the migration check runs again and changes nothing.
+  const before = store._schemaVersion();
+  await store.init();
+  await store.init();
+  assert.equal(store._schemaVersion(), before);
+  await store.close();
   await store.close();
 });
 
