@@ -667,14 +667,14 @@ test("5. an exhausted season fails loudly: no signature, no nonce burned, no all
   const judge = await boot();
 
   // Make sure the twenty-season schedule really is on disk, then fill season-1
-  // to EXACTLY its 2,000,000 CATT allocation. The filler is not a user of this
+  // to EXACTLY its 3,300,000 CATT allocation. The filler is not a user of this
   // Judge: it stands in for the season having already been mined out by
   // history, which is exactly the state an exhausted season is in.
   await seasons.ensureSeasons(judge.store, { epoch: BOOT_SECONDS });
   const season = await judge.store.getSeason("season-1");
   assert.ok(season, "the boot must have written season-1");
   assert.equal(season.allocation, seasons.SEASON_ALLOCATION);
-  assert.equal(season.allocation, "2000000000000000000000000");
+  assert.equal(season.allocation, "3300000000000000000000000");
 
   await judge.store.recordSeasonClaim({ seasonId: "season-1", userAddress: FILLER, amount: season.allocation, nonce: "1" });
   const claimedBefore = await judge.store.getSeasonClaimedTotal("season-1");
@@ -1018,29 +1018,29 @@ test("8. the wired path mutates none of the frozen economic exports", async () =
   // The founder's identities, unchanged and still exact.
   assert.equal(economics.DYNAMIC_EMISSION_TRIGGER_MINERS, 5000n);
   assert.equal(economics.DYNAMIC_EMISSION_FLOOR_BPS, 5000n);
-  assert.equal(seasons.SEASON_COUNT, 20);
+  assert.equal(seasons.SEASON_COUNT, 12);
   assert.equal(seasons.SEASON_DURATION_DAYS, 30);
-  assert.equal(seasons.SEASON_ALLOCATION, "2000000000000000000000000");
+  assert.equal(seasons.SEASON_ALLOCATION, "3300000000000000000000000");
   assert.equal(seasons.SEASON_ALLOCATION.length, 25);
-  assert.equal(seasons.TOTAL_SEASON_DAYS, 600);
-  assert.equal(seasons.TOTAL_HEADROOM_CATT, 40_000_000n);
+  assert.equal(seasons.TOTAL_SEASON_DAYS, 360);
+  assert.equal(seasons.TOTAL_HEADROOM_CATT, 39_600_000n);
   assert.equal(staminaAllowance.FREE_STAMINA_PER_DAY, 30n);
 
-  // The twenty-season schedule is byte-identical before and after, contiguous,
+  // The twelve-season schedule is byte-identical before and after, contiguous,
   // and the store the wired Judge wrote agrees with the pure planner.
   assert.equal(JSON.stringify(seasons.buildSeasonSchedule({ epoch: BOOT_SECONDS })), before.schedule);
   const schedule = seasons.buildSeasonSchedule({ epoch: BOOT_SECONDS });
-  assert.equal(schedule.length, 20);
+  assert.equal(schedule.length, 12);
   assert.equal(schedule[0].start, BOOT_SECONDS);
-  assert.equal(schedule[19].end, BOOT_SECONDS + 600 * 86_400);
+  assert.equal(schedule[11].end, BOOT_SECONDS + 360 * 86_400);
   for (let index = 1; index < schedule.length; index += 1) {
     assert.equal(schedule[index].start, schedule[index - 1].end, "season windows must be contiguous, not overlapping");
     assert.equal(schedule[index].allocation, seasons.SEASON_ALLOCATION);
   }
-  const stored = await judge.store.getSeason("season-20");
+  const stored = await judge.store.getSeason("season-12");
   assert.equal(stored.allocation, seasons.SEASON_ALLOCATION);
   assert.equal(stored.claimMode, seasons.CLAIM_MODE_DAILY);
-  assert.equal(stored.start, BOOT_SECONDS + 19 * 30 * 86_400);
+  assert.equal(stored.start, BOOT_SECONDS + 11 * 30 * 86_400);
 });
 
 /* ========================================================================== */

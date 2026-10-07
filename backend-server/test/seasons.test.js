@@ -3,16 +3,16 @@
  *
  * WHAT THIS FILE IS PROVING, in order of how much it matters:
  *
- *   1. THE HEADROOM IS 40,000,000 CATT, NOT 40,000. `20 x 2,000,000 = 40,000,000`
- *      and `2,000,000 CATT at 18 decimals` is a 25-DIGIT base-unit string. The
- *      22-digit literal `"2000000000000000000"` that a lost attempt of this
- *      module carried is 2,000 CATT — a 1000x typo that satisfies every local
+ *   1. THE HEADROOM IS 39,600,000 CATT, NOT 39,600. `12 x 3,300,000 = 39,600,000`
+ *      and `3,300,000 CATT at 18 decimals` is a 25-DIGIT base-unit string. The
+ *      22-digit literal `"3300000000000000000000"` that a lost attempt of this
+ *      module carried is 3,300 CATT — a 1000x typo that satisfies every local
  *      check and starves the schedule on day two. It is named here and asserted
  *      against, because a typo that is only prevented by being remembered is a
  *      typo waiting to come back.
  *
  *   2. THE CAP IS A HARD CAP AND IT IS LOUD. A season filled to exactly its
- *      2,000,000 CATT refuses the next claim of ANY positive amount with
+ *      3,300,000 CATT refuses the next claim of ANY positive amount with
  *      `SEASON_ALLOCATION_EXHAUSTED`, and the season total does not move. No
  *      clamp, no partial payment, no successful zero — all three were considered
  *      and all three are undetectable under-payment, which is worse than a
@@ -24,7 +24,7 @@
  *      season would be an uncapped pool by another name.
  *
  *   4. NOTHING IS A FLOAT. Every CATT figure crosses a boundary as an exact
- *      decimal string, `2e24` is far above `Number.MAX_SAFE_INTEGER`, and a
+ *      decimal string, `3.3e24` is far above `Number.MAX_SAFE_INTEGER`, and a
  *      value one base unit above 2^53 round-trips through `settle`,
  *      `remainingForSeason` and the store unchanged.
  *
@@ -157,20 +157,20 @@ const IN_SEASON_1 = 1000;
 /* 1. The frozen identities                                                    */
 /* ========================================================================== */
 
-test("identities: 20 seasons x 2,000,000 CATT = 40,000,000 CATT over 600 days", () => {
-  assert.equal(SEASON_COUNT, 20);
+test("identities: 12 seasons x 3,300,000 CATT = 39,600,000 CATT over 360 days", () => {
+  assert.equal(SEASON_COUNT, 12);
   assert.equal(SEASON_DURATION_DAYS, 30);
-  assert.equal(SEASON_ALLOCATION_CATT, 2_000_000n);
-  assert.equal(TOTAL_HEADROOM_CATT, 40_000_000n);
-  assert.equal(TOTAL_SEASON_DAYS, 600);
+  assert.equal(SEASON_ALLOCATION_CATT, 3_300_000n);
+  assert.equal(TOTAL_HEADROOM_CATT, 39_600_000n);
+  assert.equal(TOTAL_SEASON_DAYS, 360);
   assert.equal(SECONDS_PER_DAY, 86400);
   assert.equal(SEASON_DURATION_SECONDS, 30 * 86400);
   assert.equal(SEASON_DURATION_SECONDS, 2592000);
   assert.equal(SEASON_DURATION_SECONDS, SEASON_DURATION_DAYS * SECONDS_PER_DAY);
 
   // The founder's multiplication, in WHOLE CATT and then in base units.
-  assert.equal(BigInt(SEASON_COUNT) * SEASON_ALLOCATION_CATT, 40_000_000n);
-  assert.equal(BigInt(SEASON_COUNT) * BigInt(SEASON_DURATION_DAYS), 600n);
+  assert.equal(BigInt(SEASON_COUNT) * SEASON_ALLOCATION_CATT, 39_600_000n);
+  assert.equal(BigInt(SEASON_COUNT) * BigInt(SEASON_DURATION_DAYS), 360n);
 
   assert.equal(CATT_DECIMALS, 18);
   assert.equal(CATT_BASE_UNITS, 10n ** 18n);
@@ -178,28 +178,30 @@ test("identities: 20 seasons x 2,000,000 CATT = 40,000,000 CATT over 600 days", 
   assert.equal(
     BigInt(SEASON_ALLOCATION) * BigInt(SEASON_COUNT),
     TOTAL_HEADROOM_CATT * CATT_BASE_UNITS,
-    "all twenty allocations together are exactly the 40,000,000 CATT headroom"
+    "all twelve allocations together are exactly the 39,600,000 CATT headroom"
   );
   assert.equal(CLAIM_MODE_DAILY, "daily");
 });
 
-test("the allocation literal is 25 digits: 2,000,000 CATT, not the 22-digit 2,000 CATT typo", () => {
+test("the allocation literal is 25 digits: 3,300,000 CATT, not the 22-digit 3,300 CATT typo", () => {
   // THE 1000x TRAP, asserted rather than remembered.
   assert.equal(
     SEASON_ALLOCATION,
-    "2000000000000000000000000",
-    "the per-season allocation literal must be 2,000,000 CATT in 18-decimal base units"
+    "3300000000000000000000000",
+    "the per-season allocation literal must be 3,300,000 CATT in 18-decimal base units"
   );
-  assert.equal(SEASON_ALLOCATION.length, 25, "2,000,000 CATT at 18 decimals is a 25-digit string");
-  assert.equal(BigInt(SEASON_ALLOCATION), 2_000_000n * CATT_BASE_UNITS);
-  assert.equal(BigInt(SEASON_ALLOCATION) / CATT_BASE_UNITS, 2_000_000n);
+  assert.equal(SEASON_ALLOCATION.length, 25, "3,300,000 CATT at 18 decimals is a 25-digit string");
+  assert.equal(BigInt(SEASON_ALLOCATION), 3_300_000n * CATT_BASE_UNITS);
+  assert.equal(BigInt(SEASON_ALLOCATION) / CATT_BASE_UNITS, 3_300_000n);
 
   // What the shortened literal was, in both spellings, and what each would
   // have done to the headroom.
+  const THE_1000X_TYPO_AS_QUOTED = "3300000000000000000"; // 19 digits = 3.3 CATT
+  const THE_1000X_TYPO_AS_DESCRIBED = "3300000000000000000000"; // 22 digits = 3,300 CATT
   assert.equal(THE_1000X_TYPO_AS_QUOTED.length, 19, "the quoted literal was 19 digits");
-  assert.equal(BigInt(THE_1000X_TYPO_AS_QUOTED), 2n * CATT_BASE_UNITS, "19 digits is 2 CATT");
+  assert.equal(BigInt(THE_1000X_TYPO_AS_QUOTED), 3_300_000n * CATT_BASE_UNITS / 1_000_000n, "19 digits is 3.3 CATT");
   assert.equal(THE_1000X_TYPO_AS_DESCRIBED.length, 22, "the described literal was 22 digits");
-  assert.equal(BigInt(THE_1000X_TYPO_AS_DESCRIBED), 2_000n * CATT_BASE_UNITS, "22 digits is 2,000 CATT");
+  assert.equal(BigInt(THE_1000X_TYPO_AS_DESCRIBED), 3_300n * CATT_BASE_UNITS, "22 digits is 3,300 CATT");
   assert.equal(
     BigInt(THE_1000X_TYPO_AS_DESCRIBED),
     SEASON_ALLOCATION_CATT * CATT_BASE_UNITS / 1000n,
@@ -207,32 +209,32 @@ test("the allocation literal is 25 digits: 2,000,000 CATT, not the 22-digit 2,00
   );
   assert.notEqual(SEASON_ALLOCATION, THE_1000X_TYPO_AS_QUOTED);
   assert.notEqual(SEASON_ALLOCATION, THE_1000X_TYPO_AS_DESCRIBED);
-  // 20 x either shortened literal falls far short of the founder's headroom:
+  // 12 x either shortened literal falls far short of the founder's headroom:
   // 22 digits shrinks it 1,000x, 19 digits 1,000,000x.
   const fullHeadroom = TOTAL_HEADROOM_CATT * CATT_BASE_UNITS;
   assert.equal(
     BigInt(SEASON_COUNT) * BigInt(THE_1000X_TYPO_AS_DESCRIBED),
     fullHeadroom / 1_000n,
-    "20 x 2,000 CATT is 40,000 CATT: a 1000x shrink of the headroom"
+    "12 x 3,300 CATT is 39,600 CATT: a 1000x shrink of the headroom"
   );
   assert.equal(
     BigInt(SEASON_COUNT) * BigInt(THE_1000X_TYPO_AS_QUOTED),
     fullHeadroom / 1_000_000n,
-    "20 x 2 CATT is 40 CATT: a 1,000,000x shrink of the headroom"
+    "12 x 3 CATT is 36 CATT: a 1,000,000x shrink of the headroom"
   );
 
   // The schedule itself carries the right literal on every row.
   for (const season of buildSeasonSchedule()) assert.equal(season.allocation, SEASON_ALLOCATION);
 });
 
-test("assertSeasonIdentities passes on the shipped schedule, and the exported ids are season-1..20", () => {
+test("assertSeasonIdentities passes on the shipped schedule, and the exported ids are season-1..12", () => {
   const schedule = assertSeasonIdentities({ epoch: SEASON_EPOCH });
-  assert.equal(schedule.length, 20);
-  assert.equal(SEASON_IDS.length, 20);
+  assert.equal(schedule.length, 12);
+  assert.equal(SEASON_IDS.length, 12);
   assert.equal(SEASON_IDS[0], "season-1");
-  assert.equal(SEASON_IDS[19], "season-20");
+  assert.equal(SEASON_IDS[11], "season-12");
   assert.ok(Object.isFrozen(SEASON_IDS), "SEASON_IDS is frozen");
-  assert.equal(new Set(SEASON_IDS).size, 20, "season ids are unique");
+  assert.equal(new Set(SEASON_IDS).size, 12, "season ids are unique");
   for (let index = 0; index < SEASON_COUNT; index += 1) {
     assert.equal(SEASON_IDS[index], `season-${index + 1}`);
   }
@@ -242,9 +244,9 @@ test("assertSeasonIdentities passes on the shipped schedule, and the exported id
 /* 2. The schedule                                                             */
 /* ========================================================================== */
 
-test("schedule: all 20 seasons with correct ids, starts, ends, allocation and claim mode", () => {
+test("schedule: all 12 seasons with correct ids, starts, ends, allocation and claim mode", () => {
   const schedule = buildSeasonSchedule({ epoch: SEASON_EPOCH });
-  assert.equal(schedule.length, 20);
+  assert.equal(schedule.length, 12);
   for (let index = 0; index < schedule.length; index += 1) {
     const season = schedule[index];
     assert.equal(season.id, `season-${index + 1}`);
@@ -254,11 +256,11 @@ test("schedule: all 20 seasons with correct ids, starts, ends, allocation and cl
     assert.equal(season.claimMode, CLAIM_MODE_DAILY);
   }
   assert.equal(schedule[0].start, 0, "season 1 starts at the epoch");
-  assert.equal(schedule[19].start, 19 * 2592000);
+  assert.equal(schedule[11].start, 11 * 2592000);
   assert.equal(
-    schedule[19].end,
-    SEASON_EPOCH + 600 * SECONDS_PER_DAY,
-    "season 20 ends exactly 600 days after the epoch"
+    schedule[11].end,
+    SEASON_EPOCH + 360 * SECONDS_PER_DAY,
+    "season 12 ends exactly 360 days after the epoch"
   );
   assert.ok(Object.isFrozen(schedule));
   assert.ok(Object.isFrozen(schedule[0]));
@@ -287,7 +289,7 @@ test("schedule: deterministic and frozen — the same epoch always yields the sa
   // An explicit epoch shifts the whole schedule and changes nothing else.
   const shifted = buildSeasonSchedule({ epoch: 1_700_000_000 });
   assert.equal(shifted[0].start, 1_700_000_000);
-  assert.equal(shifted[19].end, 1_700_000_000 + 600 * SECONDS_PER_DAY);
+  assert.equal(shifted[11].end, 1_700_000_000 + 360 * SECONDS_PER_DAY);
   assert.deepEqual(
     shifted.map((season) => season.allocation),
     first.map((season) => season.allocation)
@@ -311,7 +313,7 @@ test("liveness: exactly one season covers any instant >= epoch, and none before 
       assert.equal(seasonFor(instant).id, season.id, "seasonFor agrees with the schedule");
     }
     // Half-open: the closing instant belongs to the NEXT season.
-    if (season.id !== "season-20") {
+    if (season.id !== "season-12") {
       assert.equal(seasonFor(season.end).id, `season-${Number(season.id.slice(7)) + 1}`);
     } else {
       assert.equal(seasonFor(season.end), undefined, "nothing is live after the last season ends");
@@ -348,8 +350,8 @@ test("ensureSeasons is idempotent against both adapters and never clobbers a dif
   const memory = createMemoryStore();
   await memory.init();
   const first = await ensureSeasons(memory, { epoch: SEASON_EPOCH });
-  assert.equal(first.seasonCount, 20);
-  assert.equal(first.created.length, 20, "a fresh store has all 20 seasons written");
+  assert.equal(first.seasonCount, 12);
+  assert.equal(first.created.length, 12, "a fresh store has all 12 seasons written");
   assert.deepEqual(first.preserved, []);
   assert.equal(first.epoch, SEASON_EPOCH);
 
@@ -403,7 +405,7 @@ test("settle: daily mode accumulates and pays immediately, per claim", async () 
     assert.equal(first.userAccrued, "1000000000000000000");
     assert.equal(first.seasonClaimedTotal, "1000000000000000000");
     assert.equal(first.remaining, SEASON_ALLOCATION, "the whole pool was available before this claim");
-    assert.equal(first.remainingAfter, "1999999000000000000000000", "and 1 CATT of it after");
+    assert.equal(first.remainingAfter, "3299999000000000000000000", "and 1 CATT of it after");
 
     const second = await settle(store, {
       userAddress: USER_A,
@@ -563,7 +565,7 @@ test("settle: a replayed nonce does not double-accrue", async () => {
 /* 5. The hard cap — exhaustion is LOUD                                         */
 /* ========================================================================== */
 
-test("exhaustion: one 2,000,000 CATT claim fills the season exactly, and the next claim of ANY positive amount throws", async () => {
+test("exhaustion: one 3,300,000 CATT claim fills the season exactly, and the next claim of ANY positive amount throws", async () => {
   await bothAdapters("exhaust-single", async (store) => {
     const filled = await settle(store, {
       userAddress: USER_A,
@@ -573,7 +575,7 @@ test("exhaustion: one 2,000,000 CATT claim fills the season exactly, and the nex
     });
     assert.equal(filled.paid, SEASON_ALLOCATION);
     assert.equal(filled.seasonClaimedTotal, SEASON_ALLOCATION, "the season is filled to exactly its allocation");
-    assert.equal(filled.remainingAfter, "0", "nothing is left once the 2,000,000 CATT claim lands");
+    assert.equal(filled.remainingAfter, "0", "nothing is left once the 3,300,000 CATT claim lands");
     assert.equal(filled.remaining, SEASON_ALLOCATION, "and the whole pool was what was available before it");
 
     const exhausted = await remainingForSeason(store, "season-1");
@@ -618,11 +620,11 @@ test("exhaustion: one 2,000,000 CATT claim fills the season exactly, and the nex
 
 test("exhaustion: a ladder of smaller claims fills the season to exactly its allocation, then the next fails", async () => {
   await bothAdapters("exhaust-ladder", async (store) => {
-    // 40 claims of 50,000 CATT = 2,000,000 CATT. Integer base units throughout:
+    // 66 claims of 50,000 CATT = 3,300,000 CATT. Integer base units throughout:
     // 50000 * 10^18.
     const rung = 50_000n * CATT_BASE_UNITS;
-    assert.equal(rung * 40n, SEASON_ALLOCATION_CATT * CATT_BASE_UNITS);
-    for (let step = 1; step <= 40; step += 1) {
+    assert.equal(rung * 66n, SEASON_ALLOCATION_CATT * CATT_BASE_UNITS);
+    for (let step = 1; step <= 66; step += 1) {
       const result = await settle(store, {
         userAddress: step % 2 === 0 ? USER_B : USER_A,
         amount: rung.toString(),
@@ -635,7 +637,7 @@ test("exhaustion: a ladder of smaller claims fills the season to exactly its all
     }
     assert.equal(await store.getSeasonClaimedTotal("season-1"), SEASON_ALLOCATION);
 
-    // 41st claim, from a third user who has never claimed: refused, loudly.
+    // 67th claim, from a third user who has never claimed: refused, loudly.
     await assert.rejects(
       () => settle(store, { userAddress: USER_C, amount: rung.toString(), nonce: 99, now: IN_SEASON_1 + 99 }),
       (err) => {
@@ -797,16 +799,16 @@ test("pool: remaining, claimed and still-unallocated across the whole headroom",
     assert.equal(await totalHeadroomClaimed(store), "0");
     assert.equal(
       await totalHeadroomStillUnallocated(store),
-      (40_000_000n * CATT_BASE_UNITS).toString(),
-      "a fresh 20-season schedule still holds the whole 40,000,000 CATT"
+      (39_600_000n * CATT_BASE_UNITS).toString(),
+      "a fresh 12-season schedule still holds the whole 39,600,000 CATT"
     );
 
     await settle(store, { userAddress: USER_A, amount: SEASON_ALLOCATION, nonce: 1, now: IN_SEASON_1 });
     assert.equal(await totalHeadroomClaimed(store), SEASON_ALLOCATION);
     assert.equal(
       await totalHeadroomStillUnallocated(store),
-      (38_000_000n * CATT_BASE_UNITS).toString(),
-      "season 1's spent 2,000,000 CATT is NOT recycled into anyone"
+      (36_300_000n * CATT_BASE_UNITS).toString(),
+      "season 1's spent 3,300,000 CATT is NOT recycled into anyone"
     );
 
     // A season that has not been written yet still owns its full allocation.
@@ -826,8 +828,8 @@ test("pool: remaining, claimed and still-unallocated across the whole headroom",
     assert.equal(await totalHeadroomClaimed(store), (BigInt(SEASON_ALLOCATION) + 1_000_000_000_000_000_000n).toString());
     assert.equal(
       await totalHeadroomStillUnallocated(store),
-      (38_000_000n * CATT_BASE_UNITS - 1_000_000_000_000_000_000n).toString(),
-      "season 1 is still exhausted and season 3 has spent 1 CATT; 38,000,000 CATT remain"
+      (36_300_000n * CATT_BASE_UNITS - 1_000_000_000_000_000_000n).toString(),
+      "season 1 is still exhausted and season 3 has spent 1 CATT; 36,300,000 CATT remain"
     );
   });
 });
