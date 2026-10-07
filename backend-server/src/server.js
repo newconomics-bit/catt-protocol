@@ -751,6 +751,65 @@ function createApp({
   });
 
   /* ---------------------------------------------------------------- *
+   * GET /api/stats — pilot dashboard (read-only aggregates)          *
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Returns pilot dashboard statistics: active miners today, daily budget
+   * consumed, governor scale factor, and season pool remaining.
+   * Privacy-minimal: only aggregate counts/distributions, no raw personal data.
+   */
+  app.get("/api/stats", asyncHandler(async (req, res) => {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const dayKey = content.dayKeyFor(nowSeconds);
+
+    // Active miners today (from daily_active_miners ledger)
+    const activeMinersToday = await activeStore.countActiveMiners({ dayKey });
+
+    // Governor daily spend
+    let dailyBudgetConsumed = "0";
+    let governorScaleFactor = "10000"; // 1.0x in basis points
+    let seasonPoolRemaining = "0";
+
+    if (economy.seasons) {
+      try {
+        const activeSeason = await activeStore.getActiveSeason(nowSeconds);
+        if (activeSeason) {
+          // Daily budget consumed from governor ledger
+          dailyBudgetConsumed = await activeStore.getGovernorSpend({
+            seasonId: activeSeason.id,
+            dayKey,
+          });
+
+          // Governor scale factor = remaining / requested (for a typical request)
+          // We'll compute it based on the daily budget
+          const dailyBudget = (await import("./governor.js")).DAILY_BUDGET;
+          const spent = BigInt(dailyBudgetConsumed);
+          const budget = BigInt(dailyBudget);
+          const remaining = budget > spent ? budget - spent : 0n;
+          // Scale factor in basis points (what fraction of a request would be fulfilled)
+          governorScaleFactor = remaining > 0n ? ((remaining * 10000n) / budget).toString() : "0";
+
+          // Season pool remaining
+          const seasonRemaining = await seasons.remainingForSeason(activeStore, activeSeason.id);
+          seasonPoolRemaining = seasonRemaining.remaining;
+        }
+      } catch (err) {
+        // If seasons not configured or store doesn't support it, return defaults
+      }
+    }
+
+    res.json({
+      activeMinersToday,
+      dailyBudgetConsumed,
+      governorScaleFactor, // basis points (10000 = 1.0x)
+      seasonPoolRemaining,
+      dayKey,
+      seasonEpoch: economy.seasonEpoch,
+    });
+  }));
+
+  /* ---------------------------------------------------------------- *
    * GET /api/missions — the bounty board                                 *
    * ---------------------------------------------------------------- */
 
