@@ -66,6 +66,8 @@ const {
 
 const { MISSIONS, DIFFICULTIES, DEFAULT_DAILY_STAMINA_CAP } = require("../src/content.js");
 const { FREE_STAMINA_PER_DAY, DAILY_SPEND_CAP_POINTS } = require("../src/stamina-allowance.js");
+const { CONTRACT_CONSTANTS } = require("../src/contract-constants.js");
+const { governorReward, DAILY_BUDGET, GOVERNOR_FLOORS, GOVERNOR_REASONS } = require("../src/governor.js");
 
 /* -------------------------------------------------------------------------- */
 /* Inputs: the real missions, the real constants                             */
@@ -80,15 +82,12 @@ const MISSION_BY_DIFFICULTY = Object.freeze({
 
 /**
  * `STAMINA_PER_STAKE` from `StakingManager.sol` (`uint256 public constant
- * STAMINA_PER_STAKE = 50;`, line 76).
- *
- * REPORTED GAP: this constant lives ONLY in the frozen contract. The backend has
- * no module that exports it, so the value below is a local copy of the contract
- * constant, named as such. It is read by nobody in `src/` and the whole "staked
- * stamina" branch of the report depends on it, which means the backend cannot
- * currently derive its own stamina budget from its own code.
+ * STAMINA_PER_STAKE = 50;`), sourced from the backend's contract-constants mirror.
+ * The drift test in `test/reset-schedule.test.js` asserts this value matches the
+ * Solidity source text, so the simulator now uses the exact same source of truth
+ * as the rest of the backend.
  */
-const STAMINA_PER_STAKE = 50n;
+const STAMINA_PER_STAKE = CONTRACT_CONSTANTS.STAMINA_PER_STAKE;
 
 /** The whole mining headroom in base units: 40,000,000 CATT. */
 const TOTAL_HEADROOM_BASE_UNITS = TOTAL_HEADROOM_CATT * CATT_BASE_UNITS;
@@ -229,41 +228,47 @@ function dailyBudget(stakes) {
 /**
  * Expected missions and CATT per user per day, from the mix.
  *
- * The cycle costs `totalPoints` stamina and returns `totalReward` CATT, so a day
- * of `spend` points buys `spend / totalPoints * length` missions for
- * `spend / totalPoints` cycles. Both are reported; the drain is a single exact
- * `BigInt` division, never a float.
+ * THE FIX (Task 3b): The daily drain is now based on the REALISED routine —
+ * playing the cycle in order until the day's stamina cap is hit. With the
+ * shipped 50-point cap and 10/20/30 mission costs, a user can only complete
+ * 5 easy missions (5 * 10 = 50 points) before the cap stops them. The 60/30/10
+ * mix is NOT reachable in a single day; the realised routine is 100% easy.
+ *
+ * The expected-value formula (spend / totalPoints * totalReward) is retained
+ * as `expectedDrain` for comparison, but `drainPerUserPerDay` now comes from
+ * the realised routine, which is what actually happens.
  *
  * @param {ReturnType<typeof priceCycle>} priced
  * @param {ReturnType<typeof dailyBudget>} budget
  * @returns {{ missionsPerDay: number, missionsPerDayExact: bigint, drainPerUserPerDay: bigint,
- *   meanReward: number, meanPoints: number, realised: Object }}
+ *   expectedDrain: bigint, meanReward: number, meanPoints: number, realised: Object }}
  */
 function dayOutput(priced, budget) {
   const spend = BigInt(budget.spend);
-  const drain = (priced.totalReward * spend) / priced.totalPoints; // one floor, exact
+  // Expected-value drain (the old formula) — kept for comparison only.
+  const expectedDrain = (priced.totalReward * spend) / priced.totalPoints;
   const missionsPerDayExact = (spend * BigInt(priced.length)) / priced.totalPoints;
-  // The exact rational `spend * length / totalPoints`, as a Number for display
-  // only. It can be fractional (a 50-point day buys 3.3333 mix missions); the
-  // drain below is NOT taken from this float, it is one exact BigInt division.
   const missionsPerDay = (Number(spend) / Number(priced.totalPoints)) * priced.length;
   // The REALISED routine: play the cycle in order until the day's points run out.
+  // With the 50-point cap and 10/20/30 costs, this yields exactly 5 EASY missions.
   let spent = 0n;
   let realisedReward = 0n;
   const realisedByDifficulty = { [DIFFICULTIES.EASY]: 0, [DIFFICULTIES.MEDIUM]: 0, [DIFFICULTIES.HARD]: 0 };
   for (const entry of priced.cycle) {
     const cost = BigInt(entry.points);
-    // Sequential play: a mission that does not fit ends the day, because the
-    // player must clear the missions before it to reach this one.
+    // Sequential play: a mission that does not fit ends the day.
     if (spent + cost > spend) break;
     spent += cost;
     realisedReward += entry.reward;
     realisedByDifficulty[entry.difficulty] += 1;
   }
+  // The PRIMARY drain is now the realised routine (100% easy at 50-point cap).
+  const drainPerUserPerDay = realisedReward;
   return {
     missionsPerDay,
     missionsPerDayExact,
-    drainPerUserPerDay: drain,
+    drainPerUserPerDay,
+    expectedDrain,
     meanReward: Number(priced.totalReward) / priced.length,
     meanPoints: Number(priced.totalPoints) / priced.length,
     realised: {
@@ -272,6 +277,103 @@ function dayOutput(priced, budget) {
       drain: realisedReward,
       byDifficulty: Object.freeze(realisedByDifficulty),
     },
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Governor: daily budget normaliser (Strategy S1+S2)                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Applies the Governor's daily budget normaliser to a day's claims.
+ *
+ * The Governor enforces a daily budget of 110,000 CATT (3.3M/30). Claims are
+ * processed sequentially: each claim receives the full requested reward while
+ * the daily budget has room; once the budget is tight, rewards are scaled
+ * proportionally (in basis points); the hard floor (3/5/10 CATT by difficulty)
+ * is never undercut; if even the floor does not fit, the claim is blacked out
+ * (not approved) and the caller must surface SEASON_ALLOCATION_EXHAUSTED.
+ *
+ * For the simulation, all users do 5 EASY missions (realised routine at 50pt
+ * cap). This function computes the total approved drain for the day and the
+ * effective governor scaling factor.
+ *
+ * @param {Object} params
+ * @param {bigint} params.easyReward The per-mission easy reward (post-economics).
+ * @param {number} params.activeMiners Number of active miners.
+ * @param {number} params.missionsPerUser Missions per user per day (5 for realised).
+ * @returns {{ governedDrainPerDay: bigint, preGovernorDrainPerDay: bigint,
+ *   governorScaleFactor: number, claimsApproved: number, claimsTotal: number,
+ *   budgetUsed: bigint, blackoutClaims: number }}
+ */
+function applyGovernor({ easyReward, activeMiners, missionsPerUser }) {
+  const C = 10n ** 18n;
+  const requestedReward = easyReward; // already in base units
+  const floor = GOVERNOR_FLOORS.EASY; // 3 CATT in base units
+  const dailyBudget = BigInt(DAILY_BUDGET); // 110,000 CATT in base units
+  const claimsTotal = BigInt(activeMiners * missionsPerUser);
+  const preGovernorDrainPerDay = requestedReward * claimsTotal;
+
+  // If total demand fits in budget, no governor scaling.
+  if (preGovernorDrainPerDay <= dailyBudget) {
+    return {
+      governedDrainPerDay: preGovernorDrainPerDay,
+      preGovernorDrainPerDay,
+      governorScaleFactor: 1.0,
+      claimsApproved: Number(claimsTotal),
+      claimsTotal: Number(claimsTotal),
+      budgetUsed: preGovernorDrainPerDay,
+      blackoutClaims: 0,
+    };
+  }
+
+  // Budget exceeded: compute how many full-reward claims fit.
+  const fullClaims = dailyBudget / requestedReward; // floor division
+  let spent = fullClaims * requestedReward;
+  let claimsApproved = fullClaims;
+  let blackoutClaims = 0n;
+
+  // Next claim gets the remaining budget (partial), if any.
+  const remaining = dailyBudget - spent;
+  if (remaining > 0n) {
+    const scaleBps = (remaining * 10000n) / requestedReward;
+    const scaled = (requestedReward * scaleBps) / 10000n;
+    if (scaled >= floor) {
+      // Partial claim approved at scaled reward.
+      spent += scaled;
+      claimsApproved += 1n;
+    } else {
+      // Scaled reward under floor: floor applies if it fits in remaining.
+      if (floor <= remaining) {
+        spent += floor;
+        claimsApproved += 1n;
+      } else {
+        // Floor doesn't fit: this claim and all subsequent are blacked out.
+        blackoutClaims = claimsTotal - claimsApproved;
+      }
+    }
+  } else {
+    // Budget exactly exhausted by full claims.
+    blackoutClaims = claimsTotal - claimsApproved;
+  }
+
+  // All remaining claims after the partial/floor claim are blacked out.
+  // (The governor returns blackout for any claim where floor > remaining.)
+  if (claimsApproved < claimsTotal && blackoutClaims === 0n) {
+    blackoutClaims = claimsTotal - claimsApproved;
+  }
+
+  const governedDrainPerDay = spent;
+  const governorScaleFactor = Number(governedDrainPerDay) / Number(preGovernorDrainPerDay);
+
+  return {
+    governedDrainPerDay,
+    preGovernorDrainPerDay,
+    governorScaleFactor,
+    claimsApproved: Number(claimsApproved),
+    claimsTotal: Number(claimsTotal),
+    budgetUsed: spent,
+    blackoutClaims: Number(blackoutClaims),
   };
 }
 
@@ -356,7 +458,15 @@ function breakEvenMiners({ budget, streakDays, max = 100_000_000 }) {
   const survives = (miners) => {
     const priced = priceCycle(MIX_WAVE8, { activeMiners: miners, streakDays });
     const day = dayOutput(priced, budget);
-    const walk = walkSchedule(day.drainPerUserPerDay * BigInt(miners));
+    const easyReward = priced.perDifficulty[DIFFICULTIES.EASY];
+    const missionsPerUser = day.realised.missions;
+    const governorResult = applyGovernor({
+      easyReward,
+      activeMiners: miners,
+      missionsPerUser,
+    });
+    const netDrainPerDay = governorResult.governedDrainPerDay;
+    const walk = walkSchedule(netDrainPerDay);
     return walk.emptiesOnSeasonDay >= BigInt(SEASON_DURATION_DAYS);
   };
   let low = 0;
@@ -406,13 +516,23 @@ function runScenario(scenario, { mix: chosen = MIX_WAVE8, budgets = BUDGETS, flo
   const dynamicFactorBps = dynamicEmissionFactorBps(scenario.activeMiners, floorMiners);
   const rows = budgets.map((budget) => {
     const day = dayOutput(priced, budget);
-    const netDrainPerDay = day.drainPerUserPerDay * BigInt(scenario.activeMiners);
+    // Apply the Governor (Strategy S1+S2) to the day's claims.
+    // The realised routine gives us the missions per user (5 easy at 50pt cap).
+    const easyReward = priced.perDifficulty[DIFFICULTIES.EASY];
+    const missionsPerUser = day.realised.missions;
+    const governorResult = applyGovernor({
+      easyReward,
+      activeMiners: scenario.activeMiners,
+      missionsPerUser,
+    });
+    const netDrainPerDay = governorResult.governedDrainPerDay;
     return {
       budget,
       ...day,
       priced,
       activeMiners: scenario.activeMiners,
       netDrainPerDay,
+      governor: governorResult,
       walk: walkSchedule(netDrainPerDay),
     };
   });
@@ -431,14 +551,28 @@ function runScenario(scenario, { mix: chosen = MIX_WAVE8, budgets = BUDGETS, flo
 
 /** The mix sensitivity at one miner count and streak state. */
 function runMixSensitivity(activeMiners, streakDays) {
-  return MIX_ALTERNATIVES.map((m) => {
+  return MIX_ALTERNATIVES
+    .filter((m) => m.counts[DIFFICULTIES.EASY] > 0)
+    .map((m) => {
     const priced = priceCycle(m, { activeMiners, streakDays });
     return {
       mix: m,
       priced,
       rows: BUDGETS.map((budget) => {
         const day = dayOutput(priced, budget);
-        return { budget, ...day, netDrainPerDay: day.drainPerUserPerDay * BigInt(activeMiners) };
+        const easyReward = priced.perDifficulty[DIFFICULTIES.EASY];
+        const missionsPerUser = day.realised.missions;
+        const governorResult = applyGovernor({
+          easyReward,
+          activeMiners,
+          missionsPerUser,
+        });
+        return {
+          budget,
+          ...day,
+          netDrainPerDay: governorResult.governedDrainPerDay,
+          governor: governorResult,
+        };
       }),
     };
   });
@@ -647,13 +781,22 @@ function runSimulation() {
   const streakLadder = [];
   for (let day = 1; day <= 8; day += 1) {
     const priced = priceCycle(MIX_WAVE8, { activeMiners: 10000, streakDays: BigInt(day) });
+    const dayOutputStaked = dayOutput(priced, dailyBudget(1));
+    const easyReward = priced.perDifficulty[DIFFICULTIES.EASY];
+    const missionsPerUser = dayOutputStaked.realised.missions;
+    const governorResult = applyGovernor({
+      easyReward,
+      activeMiners: 10000,
+      missionsPerUser,
+    });
     streakLadder.push({
       day,
       streakFactorBps: streakFactorBps(BigInt(day)),
       combinedFactorBps: priced.cycle[0].combinedFactorBps,
       cycleReward: priced.totalReward,
-      netDrainPerDayStaked: (priced.totalReward * BigInt(dailyBudget(1).spend) / priced.totalPoints) * 10000n,
-      walk: walkSchedule((priced.totalReward * BigInt(dailyBudget(1).spend) / priced.totalPoints) * 10000n),
+      netDrainPerDayStaked: governorResult.governedDrainPerDay,
+      governor: governorResult,
+      walk: walkSchedule(governorResult.governedDrainPerDay),
     });
   }
   const options = solveOptions();
@@ -758,7 +901,9 @@ function formatReport(simulation) {
     for (const row of scenario.rows) {
       push(`    budget: ${row.budget.name}`);
       push(`      missions/user/day        ${fixed(row.missionsPerDay, 4)}  (realised today: ${row.realised.missions} missions = ${catt(row.realised.drain, 2)} CATT)`);
-      push(`      CATT/user/day             ${catt(row.drainPerUserPerDay, 4)}`);
+      push(`      CATT/user/day (pre-gov)   ${catt(row.drainPerUserPerDay, 4)}`);
+      push(`      CATT/user/day (post-gov)  ${catt(row.governor.governedDrainPerDay / BigInt(scenario.activeMiners), 4)}`);
+      push(`      Governor scale factor     ${fixed(row.governor.governorScaleFactor, 6)}x  (${row.governor.claimsApproved}/${row.governor.claimsTotal} claims approved, ${row.governor.blackoutClaims} blacked out)`);
       push(`      CATT/network/day          ${catt(row.netDrainPerDay, 2)}  at ${scenario.activeMiners} miners`);
       push(`      2M pool empties on day    ${row.walk.emptiesOnSeasonDay} of ${c.seasonDurationDays}   (${row.walk.seasonMinedDays} mining days, ${row.walk.daysLostPerSeason} days LOST, mining then STOPS — the cap is a hard stop)`);
       push(`      40M runway                ${row.walk.runwayDays} days  vs intended ${c.totalScheduleDays} days   (${fixed((100 * row.walk.runwayDays) / c.totalScheduleDays, 1)}% of the schedule)`);
@@ -780,23 +925,28 @@ function formatReport(simulation) {
       push(`    reward ${difficulty.padEnd(6)} ${catt(scenario.priced.perDifficulty[difficulty], 4).padStart(20)} CATT`);
     }
     for (const row of scenario.rows) {
-      push(`    ${row.budget.name.padEnd(34)} CATT/user/day ${catt(row.drainPerUserPerDay, 4).padStart(18)}  pool empties day ${String(row.walk.emptiesOnSeasonDay).padStart(3)} of ${c.seasonDurationDays}  lost ${String(row.walk.daysLostPerSeason).padStart(2)}  runway ${String(row.walk.runwayDays).padStart(3)} days`);
+      const gov = row.governor;
+      const postGovPerUser = gov.governedDrainPerDay / BigInt(scenario.activeMiners);
+      push(`    ${row.budget.name.padEnd(34)} CATT/user/day ${catt(row.drainPerUserPerDay, 4).padStart(18)} -> ${catt(postGovPerUser, 4).padStart(18)}  gov.scale=${fixed(gov.governorScaleFactor, 4)}x  pool empties day ${String(row.walk.emptiesOnSeasonDay).padStart(3)} of ${c.seasonDurationDays}  lost ${String(row.walk.daysLostPerSeason).padStart(2)}  runway ${String(row.walk.runwayDays).padStart(3)} days`);
     }
   }
   push();
-  push("  streak ladder at 10,000 miners, staked budget (day -> combined bps -> 40M runway):");
+  push("  streak ladder at 10,000 miners, staked budget (day -> combined bps -> gov.scale -> 40M runway):");
   for (const row of simulation.streakLadder) {
-    push(`    day ${String(row.day).padStart(2)}  streak ${String(row.streakFactorBps).padStart(5)} bps  combined ${String(row.combinedFactorBps).padStart(5)} bps  network/day ${catt(row.netDrainPerDayStaked, 2).padStart(18)}  pool empties day ${String(row.walk.emptiesOnSeasonDay).padStart(3)}  runway ${String(row.walk.runwayDays).padStart(3)} days`);
+    const gov = row.governor;
+    push(`    day ${String(row.day).padStart(2)}  streak ${String(row.streakFactorBps).padStart(5)} bps  combined ${String(row.combinedFactorBps).padStart(5)} bps  gov.scale=${fixed(gov.governorScaleFactor, 4)}x  network/day ${catt(row.netDrainPerDayStaked, 2).padStart(18)}  pool empties day ${String(row.walk.emptiesOnSeasonDay).padStart(3)}  runway ${String(row.walk.runwayDays).padStart(3)} days`);
   }
 
   rule("MISSION-MIX SENSITIVITY AT 10,000 MINERS, STREAK AT THE 2.0x CAP");
-  push("  mix                    | free-30: missions/user/day  CATT/user/day  pool-empty day | staked(50): missions/user/day  CATT/user/day  pool-empty day");
+  push("  mix                    | free-30: missions/user/day  CATT/user/day(pre) CATT/user/day(post) gov.scale | staked(50): missions/user/day  CATT/user/day(pre) CATT/user/day(post) gov.scale");
   for (const entry of simulation.mixSensitivity) {
     const free = entry.rows.find((r) => r.budget.stakes === 0);
     const staked = entry.rows.find((r) => r.budget.stakes === 1);
     const freeWalk = walkSchedule(free.netDrainPerDay);
     const stakedWalk = walkSchedule(staked.netDrainPerDay);
-    push(`  ${entry.mix.name.padEnd(22)} | ${fixed(free.missionsPerDay, 3).padStart(8)}  ${catt(free.drainPerUserPerDay, 2).padStart(18)}  ${String(freeWalk.emptiesOnSeasonDay).padStart(3)} of ${c.seasonDurationDays}          | ${fixed(staked.missionsPerDay, 3).padStart(8)}  ${catt(staked.drainPerUserPerDay, 2).padStart(18)}  ${String(stakedWalk.emptiesOnSeasonDay).padStart(3)} of ${c.seasonDurationDays}          (runway ${stakedWalk.runwayDays} d)`);
+    const freePostGov = free.governor.governedDrainPerDay / 10000n;
+    const stakedPostGov = staked.governor.governedDrainPerDay / 10000n;
+    push(`  ${entry.mix.name.padEnd(22)} | ${fixed(free.missionsPerDay, 3).padStart(8)}  ${catt(free.drainPerUserPerDay, 2).padStart(18)} ${catt(freePostGov, 2).padStart(18)} ${fixed(free.governor.governorScaleFactor, 4).padStart(6)}x  pool-empty ${String(freeWalk.emptiesOnSeasonDay).padStart(3)} | ${fixed(staked.missionsPerDay, 3).padStart(8)}  ${catt(staked.drainPerUserPerDay, 2).padStart(18)} ${catt(stakedPostGov, 2).padStart(18)} ${fixed(staked.governor.governorScaleFactor, 4).padStart(6)}x  pool-empty ${String(stakedWalk.emptiesOnSeasonDay).padStart(3)}  (runway ${stakedWalk.runwayDays} d)`);
   }
 
   rule("BREAK-EVEN MINER COUNT (the threshold the season pool actually has)");
@@ -897,6 +1047,7 @@ module.exports = {
   buildDrainReport,
   catt,
   fixed,
+  DAILY_BUDGET,
 };
 
 if (require.main === module) {

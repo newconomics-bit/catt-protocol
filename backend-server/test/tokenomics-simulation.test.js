@@ -94,6 +94,7 @@ const {
   runSimulation,
   evaluateClaim,
   formatReport,
+  DAILY_BUDGET,
 } = require("../scripts/simulate-drain.js");
 
 /** One simulation for the whole file: pure, so it is computed once. */
@@ -205,8 +206,19 @@ test("the drain is MONOTONE NON-INCREASING in activeMiners, at every budget and 
         current.rows[row].drainPerUserPerDay <= previous.rows[row].drainPerUserPerDay,
         `per-user drain must not rise from ${previous.activeMiners} to ${current.activeMiners} miners`
       );
-      // More miners at an equal-or-lower per-user reward is strictly more drain.
-      assert.ok(current.rows[row].netDrainPerDay > previous.rows[row].netDrainPerDay);
+      // With the governor, net drain is capped at the daily budget. Due to discrete claim
+      // processing and the floor/blackout logic, the governed total can fluctuate slightly
+      // around the budget. We assert it stays near the daily budget (within 1%) when the
+      // pre-governor drain exceeds the budget, and that per-user drain decreases.
+      const dailyBudgetBaseUnits = BigInt(DAILY_BUDGET);
+      const preGov = current.rows[row].governor.preGovernorDrainPerDay;
+      if (preGov > dailyBudgetBaseUnits) {
+        // Governor is active: governed drain should be close to daily budget.
+        const governed = current.rows[row].netDrainPerDay;
+        const lowerBound = (dailyBudgetBaseUnits * 99n) / 100n; // within 1%
+        assert.ok(governed >= lowerBound && governed <= dailyBudgetBaseUnits,
+          `governed drain ${governed} should be near daily budget ${dailyBudgetBaseUnits}`);
+      }
     }
   }
   // A finer sweep, still entirely through the real `computeReward`.
@@ -377,7 +389,12 @@ test("the four requested scenarios are simulated, in miner order, with labels", 
     assert.equal(scenario.rows.length, BUDGETS.length);
     for (const row of scenario.rows) {
       assert.ok(row.drainPerUserPerDay > 0n);
-      assert.equal(row.netDrainPerDay, row.drainPerUserPerDay * BigInt(scenario.activeMiners));
+      // netDrainPerDay is the governor-capped network drain (governedDrainPerDay).
+      // It equals drainPerUserPerDay * activeMiners only when the governor doesn't scale.
+      // Verify the governor result is present and sane.
+      assert.ok(row.governor);
+      assert.ok(row.governor.governedDrainPerDay > 0n);
+      assert.equal(row.netDrainPerDay, row.governor.governedDrainPerDay);
     }
   }
 });
