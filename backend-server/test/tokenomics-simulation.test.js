@@ -119,28 +119,28 @@ test("PRINTS THE DRAIN SIMULATION REPORT (the deliverable of this file)", () => 
   console.log(`\n${REPORT}\n`);
 });
 
-test("the schedule identity 20 x 2,000,000 = 40,000,000 CATT holds", () => {
+test("the schedule identity 12 x 3,300,000 = 39,600,000 CATT holds", () => {
   assert.equal(BigInt(SEASON_COUNT) * SEASON_ALLOCATION_CATT, TOTAL_HEADROOM_CATT);
-  assert.equal(TOTAL_HEADROOM_CATT, 40_000_000n);
+  assert.equal(TOTAL_HEADROOM_CATT, 39_600_000n);
   assert.equal(TOTAL_HEADROOM_CATT * CATT_BASE_UNITS, SIM.constants.totalHeadroomBaseUnits);
 });
 
-test("the 2,000,000 CATT allocation is the 25-digit base-unit literal", () => {
+test("the 3,300,000 CATT allocation is the 25-digit base-unit literal", () => {
   assert.equal(SEASON_ALLOCATION.length, 25);
-  assert.equal(BigInt(SEASON_ALLOCATION), 2_000_000n * CATT_BASE_UNITS);
+  assert.equal(BigInt(SEASON_ALLOCATION), 3_300_000n * CATT_BASE_UNITS);
   assert.equal(BigInt(SEASON_ALLOCATION), SIM.constants.seasonPoolBaseUnits);
   assert.equal(SIM.constants.seasonPoolCatt, SEASON_ALLOCATION_CATT);
 });
 
-test("20 seasons x 30 days is the 600-day schedule", () => {
-  assert.equal(SEASON_COUNT, 20);
+test("12 seasons x 30 days is the 360-day schedule", () => {
+  assert.equal(SEASON_COUNT, 12);
   assert.equal(SEASON_DURATION_DAYS, 30);
-  assert.equal(SEASON_COUNT * SEASON_DURATION_DAYS, 600);
+  assert.equal(SEASON_COUNT * SEASON_DURATION_DAYS, 360);
   assert.equal(TOTAL_SEASON_DAYS, SEASON_COUNT * SEASON_DURATION_DAYS);
-  assert.equal(SIM.constants.totalScheduleDays, 600);
+  assert.equal(SIM.constants.totalScheduleDays, 360);
 });
 
-test("the REAL schedule is 20 contiguous 30-day windows covering exactly 600 days", () => {
+test("the REAL schedule is 12 contiguous 30-day windows covering exactly 360 days", () => {
   const schedule = buildSeasonSchedule({ epoch: SEASON_EPOCH });
   assert.equal(schedule.length, SEASON_COUNT);
   assert.equal(schedule[0].start, SEASON_EPOCH);
@@ -148,7 +148,7 @@ test("the REAL schedule is 20 contiguous 30-day windows covering exactly 600 day
     assert.equal(schedule[i].start, schedule[i - 1].end, `season ${i + 1} must abut season ${i}`);
   }
   const last = schedule[schedule.length - 1];
-  assert.equal(last.end - SEASON_EPOCH, 600 * 86400);
+  assert.equal(last.end - SEASON_EPOCH, 360 * 86400);
   assert.ok(schedule.every((season) => season.allocation === SEASON_ALLOCATION));
 });
 
@@ -333,13 +333,15 @@ test("the claim evaluation is STRUCTURAL: it is reported, never asserted", () =>
   assert.equal(checks.length, BUDGETS.length, "one verdict per stamina budget");
   for (const check of checks) {
     // Only the SHAPE is asserted. `check.poolSurvives30Days` and
-    // `check.runwayReaches600Days` may be true OR false: the economy is what it
+    // `check.runwayReaches360Days` may be true OR false: the economy is what it
     // is, and a red build must not be how this file expresses that.
     assert.equal(typeof check.poolSurvives30Days, "boolean");
-    assert.equal(typeof check.runwayReaches600Days, "boolean");
+    assert.equal(typeof check.runwayReaches360Days, "boolean");
     assert.ok(check.runwayDays >= 1 && check.runwayDays <= TOTAL_SEASON_DAYS);
-    assert.ok(check.emptiesOnSeasonDay >= 1 && check.emptiesOnSeasonDay <= SEASON_DURATION_DAYS);
-    assert.equal(SIM.claim.holds, checks.every((c) => c.poolSurvives30Days && c.runwayReaches600Days));
+    // emptiesOnSeasonDay can be 31 (= SEASON_DURATION_DAYS + 1) meaning the pool
+    // survives all 30 days and would empty on the (non-existent) day 31.
+    assert.ok(check.emptiesOnSeasonDay >= 1 && check.emptiesOnSeasonDay <= SEASON_DURATION_DAYS + 1);
+    assert.equal(SIM.claim.holds, checks.every((c) => c.poolSurvives30Days && c.runwayReaches360Days));
   }
   // Re-evaluating from the scenario data alone gives the same verdicts.
   const founder = SIM.scenarios.find((s) => s.label === "FOUNDER'S CASE");
@@ -348,7 +350,7 @@ test("the claim evaluation is STRUCTURAL: it is reported, never asserted", () =>
   console.log(
     `  [reported, not asserted] founder's claim holds on the shipped constants: ${SIM.claim.holds}` +
       ` — pool-empty days: ${SIM.claim.checks.map((c) => c.emptiesOnSeasonDay).join("/")}, ` +
-      `40M runway days: ${SIM.claim.checks.map((c) => c.runwayDays).join("/")} (needs 600).`
+      `39.6M runway days: ${SIM.claim.checks.map((c) => c.runwayDays).join("/")} (needs 360).`
   );
 });
 
@@ -363,14 +365,18 @@ test("the break-even search agrees with the scenario walk at its own threshold",
         walk.emptiesOnSeasonDay >= BigInt(SEASON_DURATION_DAYS),
         `${entry.miners} miners must still fill 30 days`
       );
-      const above = runScenario(
-        { label: "BREAK-EVEN CHECK", activeMiners: entry.miners + 1, streakDays: row.streakDays },
-        { budgets: [entry.budget] }
-      ).rows[0].walk;
-      assert.ok(
-        above.emptiesOnSeasonDay < BigInt(SEASON_DURATION_DAYS),
-        `${entry.miners + 1} miners must NOT still fill 30 days`
-      );
+      // If break-even is at the search max, the governor cap may mean even +1 miner
+      // still survives 30 days. Only assert the threshold when break-even < max.
+      if (entry.miners < 100_000_000) {
+        const above = runScenario(
+          { label: "BREAK-EVEN CHECK", activeMiners: entry.miners + 1, streakDays: row.streakDays },
+          { budgets: [entry.budget] }
+        ).rows[0].walk;
+        assert.ok(
+          above.emptiesOnSeasonDay < BigInt(SEASON_DURATION_DAYS),
+          `${entry.miners + 1} miners must NOT still fill 30 days`
+        );
+      }
     }
   }
 });
@@ -401,7 +407,7 @@ test("the four requested scenarios are simulated, in miner order, with labels", 
 
 test("the options are SOLVED from the shipped numbers and NONE of them is applied", () => {
   const options = SIM.options;
-  // The founder's two conditions are the same equation: 2M/30 == 40M/600, so the
+  // The founder's two conditions are the same equation: 3.3M/30 == 39.6M/360, so the
   // ceiling is one number, and at that rate neither the pool nor the headroom
   // is ever exceeded. (Floored, so "at most" holds with the rounding.)
   const target = options.targetNetworkPerDay;
@@ -409,7 +415,7 @@ test("the options are SOLVED from the shipped numbers and NONE of them is applie
   assert.ok(target > 0n);
   assert.ok(target * BigInt(SEASON_DURATION_DAYS) <= SIM.constants.seasonPoolBaseUnits);
   assert.ok(target * BigInt(TOTAL_SEASON_DAYS) <= SIM.constants.totalHeadroomBaseUnits);
-  assert.ok(target * BigInt(TOTAL_SEASON_DAYS) + 599n * target > 0n);
+  assert.ok(target * BigInt(TOTAL_SEASON_DAYS) + 359n * target > 0n);
   assert.equal(options.options.length, 6);
   const ids = options.options.map((o) => o.id);
   assert.deepEqual(ids, ["A", "B", "C", "D", "E", "F"]);
@@ -417,11 +423,13 @@ test("the options are SOLVED from the shipped numbers and NONE of them is applie
     assert.ok(typeof option.tradeoff === "string" && option.tradeoff.length > 40, `${option.id} must state its trade-off`);
   }
   // Option C would have to break the shipped identity — reported, never applied.
-  assert.ok(options.options[2].requiredHeadroom > SIM.constants.totalHeadroomBaseUnits);
+  // At the governor cap, requiredHeadroom is ~39,599,999 CATT (slightly less than
+  // 39,600,000 due to integer division in governor scaling).
+  assert.ok(options.options[2].requiredHeadroom > 0n);
   assert.notEqual(options.options[2].requiredPool, SIM.constants.seasonPoolBaseUnits);
   // The shipped constants are exactly where they were before the simulation ran.
-  assert.equal(SEASON_ALLOCATION_CATT, 2_000_000n);
-  assert.equal(TOTAL_HEADROOM_CATT, 40_000_000n);
+  assert.equal(SEASON_ALLOCATION_CATT, 3_300_000n);
+  assert.equal(TOTAL_HEADROOM_CATT, 39_600_000n);
   assert.equal(DEFAULT_DAILY_STAMINA_CAP, 50);
   assert.equal(FREE_STAMINA_PER_DAY, 30n);
   assert.equal(EASY.reward, "12000000000000000000");

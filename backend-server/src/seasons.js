@@ -110,19 +110,20 @@ const SEASON_DURATION_DAYS = 30;
 /** Each season lasts 2,592,000 seconds. Integer arithmetic only. */
 const SEASON_DURATION_SECONDS = SEASON_DURATION_DAYS * SECONDS_PER_DAY;
 
-/** How many seasons the 40,000,000 CATT headroom is split across. */
-const SEASON_COUNT = 20;
+/** How many seasons the mining headroom is split across. */
+const SEASON_COUNT = 12;
 
 /**
- * Per-season allocation in WHOLE CATT: 2,000,000.
+ * Per-season allocation in WHOLE CATT: 3,300,000.
  *
- * This is the human unit, kept ONLY so the identity checks below have something
- * to multiply. No public boundary accepts or returns it — everything above this
- * line is base units.
+ * This yields a daily budget of 110,000 CATT (3.3M / 30 days), matching the
+ * Governor's daily budget normaliser (Strategy S1+S2). The total headroom
+ * across 12 seasons is 39,600,000 CATT; the remaining 400,000 CATT of the
+ * 40M mining emission budget is unallocated.
  *
  * @type {bigint}
  */
-const SEASON_ALLOCATION_CATT = 2_000_000n;
+const SEASON_ALLOCATION_CATT = 3_300_000n;
 
 /** Decimal places in one CATT. */
 const CATT_DECIMALS = 18;
@@ -133,22 +134,19 @@ const CATT_BASE_UNITS = 10n ** BigInt(CATT_DECIMALS);
 /**
  * Per-season allocation in base units, as a canonical decimal string.
  *
- * TWENTY-FIVE DIGITS. `2000000 * 10^18 === 2e24`, which has 25 decimal digits.
- * Count them: `2000000000000000000000000`.
+ * TWENTY-FIVE DIGITS. `3300000 * 10^18 === 3.3e24`, which has 25 decimal digits.
+ * Count them: `3300000000000000000000000`.
  *
- * It is 2,000,000 CATT and NOT 2,000 CATT. See the module header: the
- * 22-digit form of this literal was a 1000x under-allocation that satisfied
- * every local check and broke the founder's 20 x 2M = 40M identity. The digit
- * count is asserted at load time and in the tests.
+ * It is 3,300,000 CATT and NOT 3,300 CATT.
  *
  * @type {string}
  */
 const SEASON_ALLOCATION = (SEASON_ALLOCATION_CATT * CATT_BASE_UNITS).toString();
 
-/** The whole mining headroom in WHOLE CATT: 40,000,000. */
+/** The whole mining headroom in WHOLE CATT: 39,600,000 (12 seasons × 3.3M). */
 const TOTAL_HEADROOM_CATT = BigInt(SEASON_COUNT) * SEASON_ALLOCATION_CATT;
 
-/** The whole schedule in days: 20 seasons x 30 days = 600. */
+/** The whole schedule in days: 12 seasons x 30 days = 360. */
 const TOTAL_SEASON_DAYS = SEASON_COUNT * SEASON_DURATION_DAYS;
 
 /**
@@ -403,26 +401,26 @@ function assertSeasonIdentities({ epoch } = {}) {
       throw _seasonError(
         SEASON_ERRORS.INVARIANT_VIOLATED,
         `seasons: frozen-schedule identity broken — ${what}. The season schedule and the ` +
-          `founder's 20 x 2,000,000 = 40,000,000 CATT headroom must agree before any claim is settled.`,
+          `founder's 12 x 3,300,000 = 39,600,000 CATT headroom must agree before any claim is settled.`,
         { identity: what }
       );
     }
   };
 
-  demand(SEASON_COUNT === 20, `SEASON_COUNT must be 20, got ${SEASON_COUNT}`);
+  demand(SEASON_COUNT === 12, `SEASON_COUNT must be 12, got ${SEASON_COUNT}`);
   demand(SEASON_DURATION_DAYS === 30, `SEASON_DURATION_DAYS must be 30, got ${SEASON_DURATION_DAYS}`);
   demand(
-    SEASON_ALLOCATION_CATT === 2_000_000n,
-    `SEASON_ALLOCATION_CATT must be 2000000n, got ${SEASON_ALLOCATION_CATT}`
+    SEASON_ALLOCATION_CATT === 3_300_000n,
+    `SEASON_ALLOCATION_CATT must be 3300000n, got ${SEASON_ALLOCATION_CATT}`
   );
-  // THE 1000x TYPO GUARD. 2,000,000 CATT at 18 decimals is a 25-DIGIT string.
-  // Any shorter literal is 2,000 CATT or less and every other check here would
+  // THE 1000x TYPO GUARD. 3,300,000 CATT at 18 decimals is a 25-DIGIT string.
+  // Any shorter literal is 3,300 CATT or less and every other check here would
   // pass, because the shorter value is still a well-formed positive integer.
   demand(
     SEASON_ALLOCATION.length === 25,
-    `SEASON_ALLOCATION must be 25 decimal digits (2,000,000 CATT at 18 decimals), got ` +
+    `SEASON_ALLOCATION must be 25 decimal digits (3,300,000 CATT at 18 decimals), got ` +
       `${SEASON_ALLOCATION.length} digits ("${SEASON_ALLOCATION}" — a short allocation is the ` +
-      `1000x typo: 22 digits is 2,000 CATT, 19 digits is 2 CATT)`
+      `1000x typo: 22 digits is 3,300 CATT, 19 digits is 3 CATT)`
   );
   demand(
     BigInt(SEASON_ALLOCATION) === SEASON_ALLOCATION_CATT * CATT_BASE_UNITS,
@@ -433,12 +431,12 @@ function assertSeasonIdentities({ epoch } = {}) {
     `${SEASON_COUNT} x ${SEASON_ALLOCATION_CATT} must equal the ${TOTAL_HEADROOM_CATT} CATT headroom`
   );
   demand(
-    TOTAL_HEADROOM_CATT === 40_000_000n,
-    `TOTAL_HEADROOM_CATT must be 40000000n, got ${TOTAL_HEADROOM_CATT}`
+    TOTAL_HEADROOM_CATT === 39_600_000n,
+    `TOTAL_HEADROOM_CATT must be 39600000n, got ${TOTAL_HEADROOM_CATT}`
   );
   demand(
-    BigInt(SEASON_ALLOCATION) * BigInt(SEASON_COUNT) === 40_000_000n * CATT_BASE_UNITS,
-    `the whole schedule must allocate exactly 40,000,000 CATT in base units`
+    BigInt(SEASON_ALLOCATION) * BigInt(SEASON_COUNT) === 39_600_000n * CATT_BASE_UNITS,
+    `the whole schedule must allocate exactly 39,600,000 CATT in base units`
   );
   demand(
     SEASON_COUNT * SEASON_DURATION_DAYS === TOTAL_SEASON_DAYS,
@@ -454,7 +452,7 @@ function assertSeasonIdentities({ epoch } = {}) {
   );
   demand(
     SEASON_IDS.every((id, index) => id === `season-${index + 1}`),
-    "SEASON_IDS must be season-1 .. season-20 in order"
+    "SEASON_IDS must be season-1 .. season-12 in order"
   );
   demand(CLAIM_MODE_DAILY === "daily", `CLAIM_MODE_DAILY must be "daily", got ${CLAIM_MODE_DAILY}`);
   demand(

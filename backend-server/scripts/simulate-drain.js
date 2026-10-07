@@ -294,6 +294,10 @@ function dayOutput(priced, budget) {
  * is never undercut; if even the floor does not fit, the claim is blacked out
  * (not approved) and the caller must surface SEASON_ALLOCATION_EXHAUSTED.
  *
+ * This implementation matches the real `governorReward` logic: it continues
+ * paying the floor for subsequent claims until the floor no longer fits in the
+ * remaining budget (at which point all remaining claims are blacked out).
+ *
  * For the simulation, all users do 5 EASY missions (realised routine at 50pt
  * cap). This function computes the total approved drain for the day and the
  * effective governor scaling factor.
@@ -307,7 +311,6 @@ function dayOutput(priced, budget) {
  *   budgetUsed: bigint, blackoutClaims: number }}
  */
 function applyGovernor({ easyReward, activeMiners, missionsPerUser }) {
-  const C = 10n ** 18n;
   const requestedReward = easyReward; // already in base units
   const floor = GOVERNOR_FLOORS.EASY; // 3 CATT in base units
   const dailyBudget = BigInt(DAILY_BUDGET); // 110,000 CATT in base units
@@ -327,42 +330,44 @@ function applyGovernor({ easyReward, activeMiners, missionsPerUser }) {
     };
   }
 
-  // Budget exceeded: compute how many full-reward claims fit.
-  const fullClaims = dailyBudget / requestedReward; // floor division
-  let spent = fullClaims * requestedReward;
-  let claimsApproved = fullClaims;
-  let blackoutClaims = 0n;
+  // Budget exceeded: process claims sequentially like the real governor.
+  let spent = 0n;
+  let claimsApproved = 0n;
 
-  // Next claim gets the remaining budget (partial), if any.
-  const remaining = dailyBudget - spent;
-  if (remaining > 0n) {
-    const scaleBps = (remaining * 10000n) / requestedReward;
-    const scaled = (requestedReward * scaleBps) / 10000n;
-    if (scaled >= floor) {
-      // Partial claim approved at scaled reward.
-      spent += scaled;
-      claimsApproved += 1n;
+  for (let i = 0n; i < claimsTotal; i++) {
+    const remaining = dailyBudget - spent;
+    if (remaining <= 0n) {
+      // Budget exhausted - all remaining claims blacked out.
+      break;
+    }
+
+    if (requestedReward <= remaining) {
+      // Full reward fits.
+      spent += requestedReward;
+      claimsApproved++;
     } else {
-      // Scaled reward under floor: floor applies if it fits in remaining.
-      if (floor <= remaining) {
-        spent += floor;
-        claimsApproved += 1n;
+      // Budget tight: proportional scale-down.
+      const scaleBps = (remaining * 10000n) / requestedReward;
+      const scaled = (requestedReward * scaleBps) / 10000n;
+
+      if (scaled >= floor) {
+        // Scaled reward above floor - approve at scaled amount.
+        spent += scaled;
+        claimsApproved++;
       } else {
-        // Floor doesn't fit: this claim and all subsequent are blacked out.
-        blackoutClaims = claimsTotal - claimsApproved;
+        // Scaled reward below floor - apply floor if it fits.
+        if (floor <= remaining) {
+          spent += floor;
+          claimsApproved++;
+        } else {
+          // Floor doesn't fit - this and all remaining claims blacked out.
+          break;
+        }
       }
     }
-  } else {
-    // Budget exactly exhausted by full claims.
-    blackoutClaims = claimsTotal - claimsApproved;
   }
 
-  // All remaining claims after the partial/floor claim are blacked out.
-  // (The governor returns blackout for any claim where floor > remaining.)
-  if (claimsApproved < claimsTotal && blackoutClaims === 0n) {
-    blackoutClaims = claimsTotal - claimsApproved;
-  }
-
+  const blackoutClaims = claimsTotal - claimsApproved;
   const governedDrainPerDay = spent;
   const governorScaleFactor = Number(governedDrainPerDay) / Number(preGovernorDrainPerDay);
 
@@ -421,8 +426,9 @@ function walkSchedule(netDrainPerDay) {
   const minedDaysTotal = Number(seasonMinedDays) * SEASON_COUNT;
   const totalDrained = drainedThisSeason * BigInt(SEASON_COUNT);
   const runwayDays = minedDaysTotal;
-  const headroomExhausted = runwayDays <= TOTAL_SEASON_DAYS;
-  const leftover = TOTAL_HEADROOM_BASE_UNITS - totalDrained;
+  const poolExhaustsEarly = emptiesOnSeasonDay <= BigInt(SEASON_DURATION_DAYS);
+  const headroomExhausted = poolExhaustsEarly;
+  const leftover = poolExhaustsEarly ? 0n : TOTAL_HEADROOM_BASE_UNITS - totalDrained;
 
   return {
     netDrainPerDay,
@@ -435,7 +441,7 @@ function walkSchedule(netDrainPerDay) {
     runwayDays,
     totalDrained,
     headroomExhausted,
-    leftover: leftover > 0n ? leftover : 0n,
+    leftover,
     daysOfScheduleThatPaid: runwayDays,
     scheduleDays: TOTAL_SEASON_DAYS,
   };
@@ -751,18 +757,18 @@ function evaluateClaim(simulation) {
   const checks = [];
   for (const row of founder.rows) {
     const poolSurvives = row.walk.emptiesOnSeasonDay >= BigInt(SEASON_DURATION_DAYS);
-    const runwayReaches600 = row.walk.headroomExhausted && row.walk.runwayDays >= simulation.totalScheduleDays;
+    const runwayReaches360 = row.walk.headroomExhausted && row.walk.runwayDays >= simulation.constants.totalScheduleDays;
     checks.push({
       budget: row.budget.name,
       poolSurvives30Days: poolSurvives,
       emptiesOnSeasonDay: Number(row.walk.emptiesOnSeasonDay),
       runwayDays: row.walk.runwayDays,
-      runwayReaches600Days: runwayReaches600,
+      runwayReaches360Days: runwayReaches360,
     });
   }
   return {
     checks,
-    holds: checks.every((c) => c.poolSurvives30Days && c.runwayReaches600Days),
+    holds: checks.every((c) => c.poolSurvives30Days && c.runwayReaches360Days),
   };
 }
 

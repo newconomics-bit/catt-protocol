@@ -57,9 +57,9 @@ The genesis mint is deliberately below `MAX_SUPPLY` because mining claims mint *
 
 This subsection documents the **currently active defaults** of the "Jalur B" / aggressive launch: the growth mechanics that ship ON, that the founder chose, and that the rest of this PRD's conservative framing must not be read as overriding. They are the core of current tokenomics, not a proposal. Every number below is live code in `backend-server/src/economics.js`, `backend-server/src/seasons.js`, `backend-server/src/stamina-allowance.js` and `backend-server/src/server.js`.
 
-**Season parameters.** **20** seasons, **2,000,000 CATT** per season, **30 days** per season, **600 days** total (`20 x 2,000,000 = 40,000,000 CATT`, exactly the §3.4 mining headroom; `20 x 30 = 600` days). The season pool is a **HARD CAP**: when a season's 2,000,000 CATT is exhausted before its 30 days elapse, mining for **THAT SEASON STOPS** — every claim fails loudly with `409 SEASON_ALLOCATION_EXHAUSTED`, and **no nonce is burned** (nothing is reserved, nothing is signed, nothing is minted), until the next season begins. There is no rollover of unused allocation into the next season and no off-season fallback; an instant no window covers is `409 SEASON_NO_ACTIVE_SEASON`. `SEASON_EPOCH` (`CATT_SEASON_EPOCH`) defaults to **unset**, which resolves to the boot instant of the Judge (season 1 starts when the process starts); an explicit `0` yields a schedule generated entirely inside 1970, i.e. every claim then refuses with `SEASON_NO_ACTIVE_SEASON` and the Judge signs nothing, ever. The founder never specified a launch date, so the epoch is deliberately **configurable** rather than hardcoded, and a non-numeric value falls back to the boot instant.
+**Season parameters.** **12** seasons, **3,300,000 CATT** per season, **30 days** per season, **360 days** total (`12 x 3,300,000 = 39,600,000 CATT`, matching the Governor's daily budget of 110,000 CATT/day × 360 days; the remaining 400,000 CATT of the §3.4 mining headroom is unallocated). The season pool is a **HARD CAP**: when a season's 3,300,000 CATT is exhausted before its 30 days elapse, mining for **THAT SEASON STOPS** — every claim fails loudly with `409 SEASON_ALLOCATION_EXHAUSTED`, and **no nonce is burned** (nothing is reserved, nothing is signed, nothing is minted), until the next season begins. There is no rollover of unused allocation into the next season and no off-season fallback; an instant no window covers is `409 SEASON_NO_ACTIVE_SEASON`. `SEASON_EPOCH` (`CATT_SEASON_EPOCH`) defaults to **unset**, which resolves to the boot instant of the Judge (season 1 starts when the process starts); an explicit `0` yields a schedule generated entirely inside 1970, i.e. every claim then refuses with `SEASON_NO_ACTIVE_SEASON` and the Judge signs nothing, ever. The founder never specified a launch date, so the epoch is deliberately **configurable** rather than hardcoded, and a non-numeric value falls back to the boot instant.
 
-**Season boundaries follow the 04:00 AM WIB rule** (§3.7): a calendar-month season boundary at 04:00 WIB on the 1st is implemented as 21:00 UTC on the last day of the previous month. The 20-season schedule is a contiguous sequence of 30-day windows from the epoch, each window exactly 2,592,000 seconds, with no gaps or overlaps.
+**Season boundaries follow the 04:00 AM WIB rule** (§3.7): a calendar-month season boundary at 04:00 WIB on the 1st is implemented as 21:00 UTC on the last day of the previous month. The 12-season schedule is a contiguous sequence of 30-day windows from the epoch, each window exactly 2,592,000 seconds, with no gaps or overlaps.
 
 **Dynamic emission.** Authored mission base rewards are **12 / 20 / 40 CATT** (easy / medium / hard-sponsor). Above **5,000 active miners** the reward decays **linearly**; the floor is **6 / 10 / 20 CATT** — **exactly 50% of base**, the founder's floor, so emission is reduced by at most half no matter what the miner count does. At or below 5,000 miners the factor is **exactly 1.0**, so early adopters receive the full base and strictly more than later arrivals. The factor is computed in integer basis points and clamped to `[5000, 10000]`, so truncation can never push emission below the floor. `DYNAMIC_EMISSION_FLOOR_MINERS` (`CATT_DYNAMIC_EMISSION_FLOOR_MINERS`, **default 50,000 active miners**) is an **UNSPECIFIED FOUNDER PARAMETER**: the founder specified the trigger (5,000) and the floor (50%) but **not** the top of the ramp, and those two ends alone do not determine a curve. 50,000 is this repository's documented, defensible default (a 90% drop over one order of magnitude; 0.75x at 27,500 miners; "emission has halved" as the steady state), it is **overridable per call** so a deployment need not fork the file, and it is **configurable** via the env flag. A degenerate range (`floor <= trigger`) throws `ECONOMICS_INVALID_RANGE` loudly rather than dividing by zero.
 
@@ -95,20 +95,22 @@ The founder has selected **Strategy S1+S2 (Quality + Governor)** for launch. The
 - **Viral spikes** (> 20,000 active): rewards hit the 3/5/10 floor, daily emission exceeds 110k budget but stays non-zero.
 - **Absolute exhaustion**: only when the day's 110k budget is fully consumed AND the floor cannot fit does the Governor refuse claims (blackout), deferring to the season hard cap.
 
-**Deterministic Simulation Results (Governor Active):**
+**Deterministic Simulation Results (Governor Active, 3.3M CATT/season, 12 seasons = 360 days):**
 
-| Active Miners | Stamina Budget | Pre-Gov CATT/user/day | Post-Gov CATT/user/day | Governor Scale | 2M Pool Empties | 40M Runway |
-|---|---|---|---|---|---|---|
-| 1,000 | Free (30pts) | 12.00 | 12.00 | 1.000x | Day 30/30 | 600 days |
-| 1,000 | Staked (50pts) | 20.00 | 18.33 | 0.917x | Day 30/30 | 600 days |
-| 5,000 | Free (30pts) | 12.00 | 3.67 | 0.306x | Day 28/30 | 560 days |
-| 5,000 | Staked (50pts) | 20.00 | 3.67 | 0.183x | Day 28/30 | 560 days |
-| **10,000** | **Free (30pts)** | **12.00** | **1.94** | **0.162x** | **Day 19/30** | **380 days** |
-| **10,000** | **Staked (50pts)** | **20.00** | **1.94** | **0.097x** | **Day 19/30** | **380 days** |
-| 20,000 | Free (30pts) | 12.00 | 1.10 | 0.092x | Day 10/30 | 200 days |
-| 20,000 | Staked (50pts) | 20.00 | 1.10 | 0.055x | Day 10/30 | 200 days |
+| Active Miners | Stamina Budget | Missions/u/d | Pre-Gov CATT/u/d | Post-Gov CATT/u/d | Governor Scale | 3.3M Pool Empties | 39.6M Runway |
+|---|---|---|---|---|---|---|---|
+| 1,000 | Free (30pts) | 3.0 | 72.00 | 72.00 | 1.000x | Day 30/30 | 360 days |
+| 1,000 | Staked (50pts) | 5.0 | 120.00 | 110.00 | 0.917x | Day 30/30 | 360 days |
+| 5,000 | Free (30pts) | 3.0 | 72.00 | 22.00 | 0.306x | Day 30/30 | 360 days |
+| 5,000 | Staked (50pts) | 5.0 | 120.00 | 22.00 | 0.183x | Day 30/30 | 360 days |
+| **10,000** | **Free (30pts)** | **3.0** | **68.00** | **11.00** | **0.162x** | **Day 30/30** | **360 days** |
+| **10,000** | **Staked (50pts)** | **5.0** | **113.34** | **11.00** | **0.097x** | **Day 30/30** | **360 days** |
+| 20,000 | Free (30pts) | 3.0 | 60.00 | 5.50 | 0.092x | Day 30/30 | 360 days |
+| 20,000 | Staked (50pts) | 5.0 | 100.00 | 5.50 | 0.055x | Day 30/30 | 360 days |
 
-**Verdict:** At the founder's claimed 10,000 active miners, the Governor reduces per-user rewards to ~2 CATT/day (hitting the floor), the 2M CATT season pool empties on day 19 (losing 11 days/season), and the 40M headroom lasts only 380 days (63% of the intended 600). The founder's claim **does not hold** under S1+S2 at 10,000 miners. A configuration change (lower rewards, smaller stamina cap, fewer missions, or larger season pool) would be required to meet the 600-day target.
+**Units:** "Missions/u/d" = missions per user per day (realised routine: 3 easy at 30pt free budget, 5 easy at 50pt staked budget). "Pre-Gov CATT/u/d" = per-user daily reward before governor scaling (missions/u/d × per-mission reward with dynamic emission + streak). "Post-Gov CATT/u/d" = per-user daily reward after governor daily budget normaliser (110,000 CATT/day global budget). "Governor Scale" = Post-Gov / Pre-Gov. "3.3M Pool Empties" = day of 30-day season when the 3,300,000 CATT pool is exhausted. "39.6M Runway" = total days until the 39,600,000 CATT headroom (12 seasons × 3.3M) is exhausted.
+
+**Verdict:** With the S1+S2 Governor (3.3M CATT/season, 110k/day budget, 3/5/10 floor), the 3.3M CATT season pool survives all 30 days at all tested miner counts (1k–20k), and the 39.6M headroom lasts the full 360-day schedule (12 seasons). The Governor scales rewards proportionally to keep daily network emission at ~110k CATT/day. At 10,000 miners, per-user rewards drop to ~11 CATT/day (Free) or ~11 CATT/day (Staked) — above the 3 CATT floor. The founder's original 600-day / 20-season target is NOT met under the new 12-season / 360-day config; the schedule is 360 days by design.
 
 ### 3.7 04:00 AM WIB Reset Rule (The "Genshin" Rule)
 
