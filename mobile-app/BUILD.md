@@ -191,16 +191,61 @@ The debug APK is a **fat APK** (~150 MB) bundling `arm64-v8a`, `armeabi-v7a` and
 flutter build apk --debug --target-platform android-arm64
 ```
 
-### Release builds
+### Release builds (signed, distributable)
 
+**Prerequisites (one-time setup):**
+
+1. **Generate a release keystore** (keep it OUTSIDE the repo, e.g. `android/keystore/release.keystore`):
+   ```bash
+   mkdir -p android/keystore
+   keytool -genkeypair -v -keystore android/keystore/release.keystore \
+     -alias release -keyalg RSA -keysize 2048 -validity 10000 \
+     -storepass YOUR_STORE_PASSWORD -keypass YOUR_KEY_PASSWORD
+   ```
+   - `YOUR_STORE_PASSWORD` and `YOUR_KEY_PASSWORD` must be strong, unique passwords.
+   - Record them in a password manager. **Losing the keystore or passwords = losing the ability to update the app on Play Store.**
+
+2. **Create `android/keystore.properties` from the template** (this file is gitignored):
+   ```bash
+   cp android/keystore.properties.example android/keystore.properties
+   # Edit android/keystore.properties with your real values
+   ```
+
+3. **Build the signed release APK:**
+   ```bash
+   cd mobile-app
+   flutter build apk --release \
+     --dart-define=CATT_BACKEND_URL=https://your-backend.example \
+     --dart-define=CATT_RPC_URL=https://polygon-amoy-rpc.example \
+     --dart-define=CATT_TOKEN_ADDRESS=0x... \
+     --dart-define=CATT_NETWORK_NAME="Polygon Amoy"
+   ```
+   Output: `mobile-app/build/app/outputs/flutter-apk/app-release.apk` (signed, optimized, shrunk).
+
+4. **Build the signed App Bundle (for Play Store):**
+   ```bash
+   flutter build appbundle --release \
+     --dart-define=CATT_BACKEND_URL=https://your-backend.example \
+     --dart-define=CATT_RPC_URL=https://polygon-amoy-rpc.example \
+     --dart-define=CATT_TOKEN_ADDRESS=0x... \
+     --dart-define=CATT_NETWORK_NAME="Polygon Amoy"
+   ```
+   Output: `mobile-app/build/app/outputs/bundle/release/app-release.aab`
+
+**How it works:**
+- `android/app/build.gradle.kts` reads `android/keystore.properties` (if present) and configures the `release` signing config.
+- If `keystore.properties` is absent (e.g., in CI), it falls back to debug signing — **the resulting APK is NOT distributable**.
+- ProGuard/R8 shrinking is enabled for release (`isMinifyEnabled = true`, `isShrinkResources = true`).
+- Rules are in `android/app/proguard-rules.pro`.
+
+**Verify the signature:**
 ```bash
-flutter build apk --release
-flutter build appbundle --release     # for Play Store
+# Check the APK is signed with your release key (not debug)
+apksigner verify --print-certs mobile-app/build/app/outputs/flutter-apk/app-release.apk
+# Should show YOUR certificate fingerprint, NOT the debug certificate
 ```
 
-> The `release` build type in `android/app/build.gradle.kts` is currently signed with
-> the **debug** keys (a Flutter template TODO). Such an artifact is not distributable
-> and must never be published. See [§10](#10-a-debug-apk-is-not-a-release-artifact).
+> ⚠️ **NEVER commit `keystore.properties` or `*.keystore` / `*.jks` files.** They are in `android/.gitignore`. If accidentally committed, rotate the keystore immediately.
 
 ---
 

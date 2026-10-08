@@ -31,11 +31,43 @@ android {
         versionName = flutter.versionName
     }
 
+    // Load keystore properties for release signing from local keystore.properties file.
+    // This file MUST NOT be committed. Create it at android/keystore.properties with:
+    //   storeFile=../keystore/release.keystore
+    //   storePassword=YOUR_STORE_PASSWORD
+    //   keyAlias=release
+    //   keyPassword=YOUR_KEY_PASSWORD
+    // The keystore file itself (release.keystore) must also be kept outside the repo.
+    val keystorePropertiesFile = rootProject.file("keystore.properties")
+    val keystoreProperties = Properties()
+    if (keystorePropertiesFile.exists()) {
+        keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+    }
+
+    signingConfigs {
+        create("release") {
+            if (keystorePropertiesFile.exists()) {
+                storeFile = file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["storePassword"] as String
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["keyPassword"] as String
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // Uses the "release" signing config if keystore.properties exists,
+            // otherwise falls back to debug signing (for CI verification only).
+            // NEVER ship an APK signed with debug keys to users.
+            signingConfig = if (keystorePropertiesFile.exists())
+                signingConfigs.getByName("release")
+            else
+                signingConfigs.getByName("debug")
+            // ProGuard/R8 shrinking for release
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 }
