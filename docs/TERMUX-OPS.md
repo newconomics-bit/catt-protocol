@@ -105,27 +105,46 @@ nano .env
 
 ```bash
 # Option A: With real yield token (set YIELD_TOKEN_ADDRESS in .env)
-npx hardhat run scripts/deploy-testnet.js --network polygon
+node scripts/deploy-testnet-standalone.js
 
 # Option B: With MockUSDT (test yield token)
-MOCK_YIELD=true npx hardhat run scripts/deploy-testnet.js --network polygon
+MOCK_YIELD=true node scripts/deploy-testnet-standalone.js
 ```
 
 **Output**: `deployed-testnet.json` (created in `smart-contracts/`). **Do NOT commit yet.**
 
+> **Why the `-standalone` script?** On Termux/Android-ARM, hardhat's
+> Solidity parser (a napi-rs native module) has no Android build, so
+> EVERY `npx hardhat ...` command — including
+> `npx hardhat run scripts/deploy-testnet.js --no-compile`, which
+> still triggers the compile task internally — dies with
+> `Error HH18 at requireNapiRsModule`. The standalone script never
+> requires hardhat: it deploys with plain ethers v6 straight from the
+> compiled artifacts committed to the repo (`artifacts/` is tracked in
+> git), so the parser is never loaded. It deploys and wires EXACTLY
+> what `scripts/deploy-testnet.js` deploys and wires — same order, same
+> checks, same manifest. On a laptop/CI with a working hardhat
+> toolchain, `MOCK_YIELD=true npx hardhat run scripts/deploy-testnet.js --network polygon`
+> remains the canonical path.
+
 ### 3.4 Deploy Mock Yield Token (if needed separately)
 
 ```bash
-# Deploys MockUSDT to Amoy and prints address
-node ../scripts/deploy-mock-yield.js --network polygon
+# Deploys MockUSDT to Amoy and prints address (standalone, no hardhat)
+node scripts/deploy-mock-yield-standalone.js
 
 # Capture output for YIELD_TOKEN_ADDRESS:
-# YIELD_TOKEN_ADDRESS=$(node ../scripts/deploy-mock-yield.js --network polygon 2>/dev/null | tail -1)
+# YIELD_TOKEN_ADDRESS=$(node scripts/deploy-mock-yield-standalone.js 2>/dev/null | grep '^MockUSDT' | awk '{print $2}')
 ```
+
+> Usually unnecessary: `MOCK_YIELD=true node scripts/deploy-testnet-standalone.js`
+> deploys its own MockUSDT as part of the full wiring. Use this only when
+> you want a mock yield token deployed ahead of time to reuse as
+> `YIELD_TOKEN_ADDRESS`.
 
 ---
 
-## 4. Commit & Push `deployed-amoy.json`
+## 4. Commit & Push `deployed-testnet.json`
 
 ```bash
 cd $HOME/catt-protocol
@@ -315,8 +334,8 @@ termux-wake-unlock
 
 | Task | Command |
 |------|---------|
-| Deploy contracts (Amoy) | `cd smart-contracts && MOCK_YIELD=true npx hardhat run scripts/deploy-testnet.js --network polygon` |
-| Deploy MockUSDT | `node scripts/deploy-mock-yield.js --network polygon` |
+| Deploy contracts (Amoy) | `cd smart-contracts && MOCK_YIELD=true node scripts/deploy-testnet-standalone.js` |
+| Deploy MockUSDT | `cd smart-contracts && node scripts/deploy-mock-yield-standalone.js` |
 | Start backend | `cd backend-server && termux-wake-lock && npm start` |
 | Stop backend | `pkill -f "node src/server.js" && termux-wake-unlock` |
 | View pilot report | `termux-open-url "https://backend.example/api/admin/pilot-report?token=$ADMIN_TOKEN"` |
@@ -338,6 +357,7 @@ termux-wake-unlock
 | `keystore: keystore password incorrect` | Check GitHub secrets match exactly |
 | `backend: ADMIN_REPORT_DISABLED` | Set `ADMIN_TOKEN` in backend `.env` and restart |
 | `deploy: deployer has no MATIC` | Fund from https://faucet.polygon.technology/ |
+| `deploy: Error HH18 ... requireNapiRsModule` | You ran a `npx hardhat ...` command. hardhat's Solidity parser (napi-rs) has no Android build. Use `node scripts/deploy-testnet-standalone.js` instead — it deploys from the committed artifacts without hardhat |
 
 ---
 
