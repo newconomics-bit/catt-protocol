@@ -1,7 +1,8 @@
 node_modules/
-artifacts/
-cache/
-typechain-types/
+# artifacts/ and cache/ are TRACKED (not ignored) for phone-only deploy.
+# Termux/Android-ARM lacks napi-rs native binary; hardhat compile fails with HH18.
+# Deployment reads JSON artifacts directly via getContractFactory — no .sol parsing needed.
+# typechain-types/
 coverage/
 coverage.json
 .env
