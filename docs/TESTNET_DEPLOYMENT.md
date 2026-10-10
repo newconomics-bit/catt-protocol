@@ -58,9 +58,18 @@ constants ever stop summing to 60,000,000.
 ```bash
 cd smart-contracts
 npm ci                 # node_modules is git-ignored; never commit it
-npx hardhat compile    # ALWAYS run from inside smart-contracts/
 npx hardhat test       # expect: 167 passing, 0 failing, 0 pending
 ```
+
+> **No compile step is needed to deploy.** The compiled
+> `artifacts/` are committed to the repo, and both deploy
+> scripts deploy straight from them. `npx hardhat compile` is
+> only needed to REGENERATE the artifacts after a contract
+> change — and it cannot run on Termux/Android-ARM at all:
+> hardhat's Solidity parser is a napi-rs native module with no
+> Android build (`Error HH18 at requireNapiRsModule`). On the
+> phone, deploy with the standalone script (§3b), which never
+> invokes hardhat.
 
 > **Known hazard in this repo:** running `npx hardhat` from the repository root
 > pulls `hardhat@3` from the registry and fails with `HHE22`. Always `cd
@@ -107,11 +116,20 @@ already loads (`.env` via `dotenv`). Copy `smart-contracts/.env.example` to
 
 `hardhat@2`'s `run` task **rejects any argument it does not define**
 (`Unrecognized param --mock-yield`), so under `npx hardhat run` use the env
-equivalents above. The CLI flags are still parsed from `argv` and work when the
+equivalents above. The CLI flags are still parsed from argv and work when the
 script is invoked directly with node (which compiles first):
 
 ```bash
 node scripts/deploy-testnet.js --mock-yield --dry-run
+```
+
+The standalone script (`scripts/deploy-testnet-standalone.js`) is
+invoked directly with node and parses the CLI flags itself, so it
+needs no env-var equivalents — and it never compiles, because it
+deploys from the committed artifacts:
+
+```bash
+node scripts/deploy-testnet-standalone.js --mock-yield --dry-run
 ```
 
 ---
@@ -131,6 +149,21 @@ npx hardhat run scripts/deploy-testnet.js
 This exercises every step of the wiring, prints the allocation table and the
 verification results, and writes the manifest outside the repo.
 
+Standalone (phone-only) equivalent — deploys and wires the SAME
+contracts in the SAME order with the SAME checks, but from the
+committed artifacts with plain ethers v6, so it needs no hardhat
+and no compilation (with `--local`, `PRIVATE_KEY` and
+`POLYGON_RPC_URL` are not required — the well-known first
+account of the local node is used):
+
+```bash
+cd smart-contracts
+SIGNER_ADDRESS=0x...  TEAM_BENEFICIARY=0x...  TREASURY_BENEFICIARY=0x... \
+MARKETING_WALLET=0x...  LIQUIDITY_WALLET=0x... \
+MOCK_YIELD=true DEPLOYMENT_OUTPUT=/tmp/deployed-testnet.json \
+node scripts/deploy-testnet-standalone.js --local --dry-run
+```
+
 ### 3b. Real testnet deployment
 
 ```bash
@@ -148,6 +181,28 @@ a known mainnet id and `--force` was not passed.
 
 With a real stablecoin instead of the mock, drop `MOCK_YIELD` and set
 `YIELD_TOKEN_ADDRESS` to a stablecoin you have verified on the Amoy explorer.
+
+### 3c. Phone-only deployment (Termux / Android-ARM)
+
+```bash
+cd smart-contracts
+# .env holds PRIVATE_KEY, POLYGON_RPC_URL (Amoy), SIGNER_ADDRESS,
+# TEAM_BENEFICIARY, TREASURY_BENEFICIARY, MARKETING_WALLET, LIQUIDITY_WALLET
+MOCK_YIELD=true node scripts/deploy-testnet-standalone.js
+```
+
+On Android, hardhat's Solidity parser (a napi-rs native module)
+has no build, so every `npx hardhat ...` command — including
+`hardhat run ... --no-compile`, which still triggers the compile
+task internally — fails with `Error HH18 at requireNapiRsModule`.
+The standalone script never requires hardhat: it deploys with
+plain ethers v6 straight from the compiled artifacts committed to
+the repo (`artifacts/` is tracked in git), so the parser is never
+loaded. Everything else — deployment order, wiring sequence,
+verification checks, the `deployed-testnet.json` manifest — is
+identical to §3b; only HOW contracts are loaded differs
+(artifact-direct `ethers.ContractFactory` instead of
+hardhat-ethers' `ethers.deployContract`).
 
 ### Deployment order (why the script is not re-orderable)
 

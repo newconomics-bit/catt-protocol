@@ -1,44 +1,51 @@
 /**
- * CATT Protocol — TESTNET deployment script.
+ * CATT Protocol — TESTNET deployment script (STANDALONE / phone-only path).
  *
  * Deploys and wires the whole on-chain system (CATT, TeamVesting,
- * StakingManager, BondManager, MiningClaimer) in the ONLY order that leaves a
- * working protocol, which is the order mandated by `MiningClaimer`'s own
- * `DeploymentNotes` NatSpec header (see the DEPLOYMENT ORDER block below).
+ * StakingManager, BondManager, MiningClaimer) in the ONLY order that
+ * leaves a working protocol — the order mandated by `MiningClaimer`'s
+ * own `DeploymentNotes` NatSpec header (see the DEPLOYMENT ORDER block
+ * below). It deploys and wires EXACTLY what scripts/deploy-testnet.js
+ * deploys and wires: same deployment order, same wiring sequence, same
+ * verification checks, same deployed-testnet.json manifest. The ONLY
+ * difference is HOW contracts are loaded: this script never requires
+ * hardhat, so the Solidity parser is never invoked.
+ *
+ * WHY THIS SCRIPT EXISTS
+ * ----------------------
+ * hardhat@2 loads its Solidity parser from a napi-rs native module
+ * that has no Termux/Android-ARM build. On the phone, every hardhat
+ * entry point that can reach the parser dies with
+ *
+ *     Error HH18 ... at requireNapiRsModule (hardhat/src/common/napi-rs.ts)
+ *
+ * — including `npx hardhat run scripts/deploy-testnet.js --no-compile`,
+ * because hardhat's `run` task triggers the compile task internally
+ * (the `--no-compile` flag does NOT suppress that nested compile).
+ * This script bypasses hardhat entirely: it deploys with plain ethers
+ * v6 straight from the COMPILED artifacts that are committed to the
+ * repo (artifacts/ is tracked in git), so the Solidity parser — the
+ * only component that calls into napi-rs — is never loaded.
  *
  * Usage
  * -----
- *   # Dry run against the in-process Hardhat network (no chain touched):
- *   MOCK_YIELD=true npx hardhat run scripts/deploy-testnet.js
+ *   # Termux / Android-ARM (the reason this script exists).
+ *   # .env holds PRIVATE_KEY, POLYGON_RPC_URL (Amoy), SIGNER_ADDRESS,
+ *   # TEAM_BENEFICIARY, TREASURY_BENEFICIARY, MARKETING_WALLET:
+ *   cd smart-contracts
+ *   node scripts/deploy-testnet-standalone.js
  *
- *   # Real testnet (Polygon Amoy — the `polygon` network in hardhat.config.js,
- *   # pointed at an Amoy RPC by POLYGON_RPC_URL):
- *   npx hardhat run scripts/deploy-testnet.js --network polygon
+ *   # Same, with the TEST-ONLY mock stablecoin as the yield token:
+ *   MOCK_YIELD=true node scripts/deploy-testnet-standalone.js
  *
- *   # Same, with the TEST-ONLY mock stablecoin:
+ *   # Dry run against a local node (start `npx hardhat node` first, on a
+ *   # machine that has a working hardhat; when PRIVATE_KEY is unset the
+ *   # well-known first account of the local node is used):
+ *   node scripts/deploy-testnet-standalone.js --local --mock-yield --dry-run
+ *
+ *   # On a laptop/CI with a working hardhat toolchain, the original
+ *   # hardhat-based script remains the canonical path:
  *   MOCK_YIELD=true npx hardhat run scripts/deploy-testnet.js --network polygon
- *
- *   # With CLI flags instead of env flags (compiles first, then runs):
- *   node scripts/deploy-testnet.js --mock-yield
- *   node scripts/deploy-testnet.js --mock-yield --dry-run
- *
- * TERMUX / ANDROID-ARM: use scripts/deploy-testnet-standalone.js
- * instead. hardhat's Solidity parser is a napi-rs native module
- * with no Android build, so every hardhat entry point — including
- * `hardhat run --no-compile`, which still triggers the compile
- * task internally — fails on the phone with Error HH18 at
- * requireNapiRsModule. The standalone script deploys the SAME
- * contracts in the SAME order with the SAME checks and the SAME
- * deployed-testnet.json manifest, using plain ethers v6 and the
- * compiled artifacts committed to the repo — no hardhat, no
- * Solidity parser, no compilation.
- *
- * WHY SOME FLAGS ARE ENV-VARS FIRST: this repo is on hardhat@2, whose `run`
- * task REJECTS any argument it does not itself define ("Unrecognized param
- * --mock-yield"), and `hardhat.config.js` is out of scope for this task, so no
- * custom task can be registered to forward them. The flags are still parsed
- * from argv (that is how `node scripts/deploy-testnet.js --mock-yield` works);
- * under `npx hardhat run` use the env equivalents.
  *
  * Flags
  * -----
@@ -47,6 +54,11 @@
  *                    permissionless and uncapped, so anybody can print the
  *                    token the bond pool pays out in. Never use it on a
  *                    network where tokens have value. Env: MOCK_YIELD=true.
+ *   --local          Target a LOCAL node (default RPC http://127.0.0.1:8545,
+ *                    e.g. `npx hardhat node`). Skips the chain-id guard and
+ *                    the PRIVATE_KEY requirement. Also implied when
+ *                    POLYGON_RPC_URL points at localhost/127.0.0.1/[::1].
+ *                    Env: LOCAL=true.
  *   --force          Overwrite an existing deployed-testnet.json instead of
  *                    refusing. Without it the script REFUSES to run.
  *                    Env: FORCE=true.
@@ -56,11 +68,14 @@
  * Required environment (see smart-contracts/.env.example and docs/TESTNET_DEPLOYMENT.md)
  * ----------------------------------------------------------------------------
  *   PRIVATE_KEY             Deployer key. 0x + 64 hex. Comma-separated for
- *                           multiple keys (hardhat.config.js already splits it).
- *                           NOT required on the in-process `hardhat` network,
- *                           which supplies its own funded accounts.
+ *                           multiple keys (the FIRST key signs — exactly the
+ *                           account hardhat.config.js uses as the first signer
+ *                           on the "polygon" network). NOT required with
+ *                           --local / a localhost RPC.
  *   POLYGON_RPC_URL         JSON-RPC endpoint. Must be the TESTNET endpoint
- *                           (Polygon Amoy, chain id 80002) for a testnet deploy.
+ *                           (Polygon Amoy, chain id 80002) for a testnet
+ *                           deploy. NOT required with --local (defaults to
+ *                           http://127.0.0.1:8545).
  *   SIGNER_ADDRESS          Backend Judge address -> MiningClaimer `signer`.
  *                           MUST be a real, non-zero address; the script fails
  *                           fast without it.
@@ -98,6 +113,8 @@
  *                           warns; a known MAINNET id aborts unless --force.
  *
  * No private key, mnemonic or RPC credential is hardcoded here (PRD Rule 2).
+ * The only key constant in this file is the PUBLIC, value-less first account
+ * of a local hardhat node, used solely for --local dry runs.
  */
 
 "use strict";
@@ -105,25 +122,90 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const hre = require("hardhat");
+// Load .env — the same dotenv load hardhat.config.js performs for the
+// hardhat-based path. This is the ONLY config loading this script does;
+// there is no hardhat config, no hardhat task, no compilation.
+require("dotenv").config();
 
-const { ethers } = hre;
+// Plain ethers v6. There is deliberately NO require("hardhat") anywhere
+// in this file: hardhat's Solidity parser is a napi-rs native module
+// with no Termux/Android-ARM build (Error HH18 at requireNapiRsModule),
+// and this script must run on the phone without ever loading it.
+const { ethers } = require("ethers");
+
+/* -------------------------------------------------------------------------- */
+/* Compiled artifacts (committed to the repo)                                 */
+/* -------------------------------------------------------------------------- */
+
+// The compiled artifacts are tracked in git (see smart-contracts/.gitignore),
+// so this script can deploy WITHOUT running the Solidity compiler — which is
+// the whole point on Termux/Android-ARM, where hardhat's napi-rs parser
+// cannot run. Paths are relative to the smart-contracts/ directory (the
+// parent of this script's directory) and match hardhat's artifacts/ layout.
+//
+// All six artifacts have empty linkReferences and no "__$" library
+// placeholders (OpenZeppelin is compiled IN, not linked), so a plain
+// ethers ContractFactory over (abi, bytecode) is a complete deployment
+// path — no library-linking step is needed.
+const ARTIFACT_FILES = Object.freeze({
+  catt: "artifacts/contracts/CATT.sol/CATT.json",
+  teamVesting: "artifacts/contracts/TeamVesting.sol/TeamVesting.json",
+  stakingManager: "artifacts/contracts/StakingManager.sol/StakingManager.json",
+  bondManager: "artifacts/contracts/BondManager.sol/BondManager.json",
+  miningClaimer: "artifacts/contracts/MiningClaimer.sol/MiningClaimer.json",
+  mockYield: "artifacts/contracts/mocks/MockUSDT.sol/MockUSDT.json",
+});
+
+/**
+ * Reads one compiled artifact from disk. Fails fast with an actionable
+ * message if the checkout is missing its committed artifacts.
+ */
+function loadArtifact(key) {
+  const relPath = ARTIFACT_FILES[key];
+  const absPath = path.resolve(__dirname, "..", relPath);
+  let raw;
+  try {
+    raw = fs.readFileSync(absPath, "utf8");
+  } catch (_) {
+    fatal(
+      `compiled artifact for ${key} is missing: ${absPath}`,
+      "This script deploys from the COMPILED artifacts committed to the repo\n" +
+        "(artifacts/ is tracked in git), so no compilation step is needed.\n" +
+        "If this file is absent, the checkout is incomplete — re-clone or\n" +
+        "restore the tracked artifacts. On a machine with a working hardhat\n" +
+        "toolchain they can be regenerated with:\n" +
+        "    cd smart-contracts && npx hardhat compile\n" +
+        "On Termux/Android-ARM that command fails (Error HH18: the napi-rs\n" +
+        "Solidity parser has no Android build) — which is exactly why this\n" +
+        "script exists."
+    );
+  }
+  let artifact;
+  try {
+    artifact = JSON.parse(raw);
+  } catch (error) {
+    fatal(`compiled artifact for ${key} is not valid JSON: ${absPath}`, String(error));
+  }
+  if (!Array.isArray(artifact.abi) || artifact.abi.length === 0) {
+    fatal(`compiled artifact for ${key} has no ABI: ${absPath}`);
+  }
+  if (
+    typeof artifact.bytecode !== "string" ||
+    !artifact.bytecode.startsWith("0x") ||
+    artifact.bytecode.length < 4
+  ) {
+    fatal(
+      `compiled artifact for ${key} has no bytecode: ${absPath}`,
+      "The committed artifact is incomplete. Regenerate it on a machine with a\n" +
+        "working hardhat toolchain:  cd smart-contracts && npx hardhat compile"
+    );
+  }
+  return artifact;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                   */
 /* -------------------------------------------------------------------------- */
-
-// Contract factories are resolved by NAME from the compiled artifacts via
-// `ethers.deployContract("<Name>", args, signer)`; the .sol sources are never
-// require()d (Node cannot parse them).
-const ARTIFACT_NAMES = Object.freeze({
-  catt: "CATT",
-  teamVesting: "TeamVesting",
-  stakingManager: "StakingManager",
-  bondManager: "BondManager",
-  miningClaimer: "MiningClaimer",
-  mockYield: "MockUSDT",
-});
 
 const ONE = 10n ** 18n;
 
@@ -149,7 +231,7 @@ const MAX_SUPPLY_CATT = 100_000_000n;
  * constructor values (15,000,000e18 and 20,000,000e18), so those two cannot
  * drift. Marketing is a SEPARATE bucket with its own destination and is never
  * folded into liquidity; liquidity is 10,000,000, not the 30,000,000 an earlier
- * revision of this script used.
+ * revision of the deploy script used.
  *
  * The remaining 40% of the cap is NOT minted at genesis, because
  * `MiningClaimer` is the sole minter after `transferOwnership` and every
@@ -182,7 +264,7 @@ const GENESIS_TOTAL_CATT =
 // buckets must account for the PRD genesis total exactly.
 if (GENESIS_TOTAL_CATT !== EXPECTED_GENESIS_TOTAL_CATT) {
   throw new Error(
-    "deploy-testnet.js: the four genesis buckets sum to " +
+    "deploy-testnet-standalone.js: the four genesis buckets sum to " +
       `${GENESIS_TOTAL_CATT} CATT but the PRD genesis mint is ${EXPECTED_GENESIS_TOTAL_CATT} CATT ` +
       `(team ${TEAM_ALLOCATION_CATT} + treasury ${TREASURY_ALLOCATION_CATT} + ` +
       `marketing ${MARKETING_ALLOCATION_CATT} + DEX liquidity ${DEX_LIQUIDITY_ALLOCATION_CATT}). ` +
@@ -195,6 +277,27 @@ const DEFAULT_INITIAL_SUPPLY_CATT = GENESIS_TOTAL_CATT;
 
 /** Polygon Amoy testnet chain id. */
 const DEFAULT_EXPECTED_CHAIN_ID = 80002n;
+
+/**
+ * The network this script deploys to. hardhat.config.js defines exactly one
+ * deployable network, named "polygon", which reads POLYGON_RPC_URL and
+ * PRIVATE_KEY; there is no separate Amoy alias, so an Amoy deployment is a
+ * deployment to the "polygon" network with POLYGON_RPC_URL pointed at an
+ * Amoy RPC (chain id 80002). The chain-id guard below confirms it.
+ */
+const NETWORK_NAME_REMOTE = "polygon";
+
+/** Default RPC for --local runs: a `npx hardhat node` process. */
+const DEFAULT_LOCAL_RPC_URL = "http://127.0.0.1:8545";
+
+/**
+ * The PUBLIC, value-less first account of a local hardhat node (the default
+ * hardhat mnemonic's account #0). Used ONLY for --local dry runs when
+ * PRIVATE_KEY is unset — never for a real network, where PRIVATE_KEY is
+ * required. It holds no real funds anywhere.
+ */
+const HARDHAT_DEFAULT_ACCOUNT_0_KEY =
+  "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 /** Chain ids that hold real value; a "testnet" deploy there is almost certainly a mistake. */
 const MAINNET_CHAIN_IDS = new Set([
@@ -240,12 +343,14 @@ function parseFlags(argv) {
   const truthy = (value) => /^(1|true|yes|on)$/i.test(String(value || ""));
   const flags = {
     mockYield: truthy(process.env.MOCK_YIELD),
+    local: truthy(process.env.LOCAL),
     force: truthy(process.env.FORCE),
     dryRun: truthy(process.env.DRY_RUN),
     unknown: [],
   };
   for (const arg of argv) {
     if (arg === "--mock-yield") flags.mockYield = true;
+    else if (arg === "--local") flags.local = true;
     else if (arg === "--force") flags.force = true;
     else if (arg === "--dry-run") flags.dryRun = true;
     else flags.unknown.push(arg);
@@ -254,6 +359,9 @@ function parseFlags(argv) {
 }
 
 const isAddress = (value) => typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value.trim());
+
+const isLocalhostUrl = (url) =>
+  /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(String(url || "").trim());
 
 /** Reads env and collects every missing/blank value so the operator fixes them in one pass. */
 function collectRequiredEnv(names) {
@@ -283,6 +391,26 @@ function pct(part, whole) {
   return `${hundredths.toFixed(2)}%`;
 }
 
+/**
+ * Best-effort human-readable revert description from a plain ethers v6 error.
+ * hardhat-ethers decorates revert errors with `shortMessage`; plain ethers
+ * v6 exposes the decoded custom-error name via `errorName`/`errorSignature`
+ * and the reason via `message`/`reason`, so every field is concatenated and
+ * the wiring probe below matches on the union.
+ */
+function describeRevert(error) {
+  return [
+    error && error.shortMessage,
+    error && error.message,
+    error && error.reason,
+    error && error.errorName,
+    error && error.errorSignature,
+    String(error),
+  ]
+    .filter((part) => typeof part === "string" && part.length > 0)
+    .join(" | ");
+}
+
 /* -------------------------------------------------------------------------- */
 /* Main                                                                        */
 /* -------------------------------------------------------------------------- */
@@ -293,21 +421,50 @@ async function main() {
   if (flags.unknown.length > 0) {
     fatal(
       `Unrecognised argument(s): ${flags.unknown.join(" ")}`,
-      "Supported flags: --mock-yield, --force, --dry-run.\n" +
-        "Run with --network polygon (the network defined in hardhat.config.js) for a real testnet."
+      "Supported flags: --mock-yield, --local, --force, --dry-run.\n" +
+        'For a real testnet deploy, point POLYGON_RPC_URL at Polygon Amoy — the\n' +
+        'same "polygon" network hardhat.config.js defines.'
     );
   }
 
-  const networkName = hre.network.name;
-  const isLocalRun = networkName === "hardhat" || networkName === "localhost";
   const mockYieldRequested = flags.mockYield;
 
-  banner("CATT PROTOCOL — TESTNET DEPLOYMENT");
-  log(`network            : ${networkName}`);
-  log(`chain id           : ${hre.network.config.chainId}`);
+  /* ---------------------------------------------------------------------- */
+  /* 0. Network selection                                                   */
+  /* ---------------------------------------------------------------------- */
+
+  // There is no hardhat `run` task here, so there is no hre.network.name to
+  // read. The network is derived from the RPC URL instead:
+  //
+  //   --local, or a POLYGON_RPC_URL pointing at localhost/127.0.0.1/[::1]
+  //     -> local mode (a `npx hardhat node` process; for dry runs)
+  //   anything else
+  //     -> the "polygon" network defined in hardhat.config.js — the network
+  //        this script deploys to. Point POLYGON_RPC_URL at Polygon Amoy
+  //        (chain id 80002) for a testnet deployment.
+  const rawRpcUrl = (process.env.POLYGON_RPC_URL || "").trim();
+  const isLocalRun = flags.local || (rawRpcUrl !== "" && isLocalhostUrl(rawRpcUrl));
+
+  let rpcUrl;
+  if (isLocalRun) {
+    rpcUrl = rawRpcUrl !== "" ? rawRpcUrl : DEFAULT_LOCAL_RPC_URL;
+    if (flags.local && rawRpcUrl !== "" && !isLocalhostUrl(rawRpcUrl)) {
+      warn(`--local was passed but POLYGON_RPC_URL (${rawRpcUrl}) is not a localhost URL.`);
+    }
+  } else {
+    // Required for remote runs; validated below together with the other env.
+    rpcUrl = rawRpcUrl;
+  }
+
+  const networkName = isLocalRun ? "localhost" : NETWORK_NAME_REMOTE;
+
+  banner("CATT PROTOCOL — TESTNET DEPLOYMENT (standalone, artifact-direct)");
+  log(`network            : ${networkName}${isLocalRun ? " (local node)" : ' (the "polygon" network from hardhat.config.js)'}`);
+  log(`rpc                : ${rpcUrl}`);
+  log(`deploy path        : ethers v6 + committed artifacts (no hardhat, no Solidity parser)`);
 
   /* ---------------------------------------------------------------------- */
-  /* 0. Configuration + fail-fast environment validation                      */
+  /* 1. Configuration + fail-fast environment validation                    */
   /* ---------------------------------------------------------------------- */
 
   const requiredEnvNames = ["SIGNER_ADDRESS", "TEAM_BENEFICIARY", "TREASURY_BENEFICIARY", "MARKETING_WALLET"];
@@ -327,7 +484,7 @@ async function main() {
         ...requiredEnvNames.map((name) => `  ${name}=...`),
         "",
         "Descriptions:",
-        "  PRIVATE_KEY           deployer key, 0x + 64 hex (hardhat.config.js splits a comma-separated list)",
+        "  PRIVATE_KEY           deployer key, 0x + 64 hex (the first key of a comma-separated list signs)",
         "  POLYGON_RPC_URL       Polygon Amoy testnet JSON-RPC endpoint (chain id 80002)",
         "  SIGNER_ADDRESS        backend Judge address -> MiningClaimer.signer",
         "  TEAM_BENEFICIARY      15,000,000 CATT vesting beneficiary",
@@ -337,7 +494,9 @@ async function main() {
         "                         or be folded into the liquidity bucket.",
         "  YIELD_TOKEN_ADDRESS   real stablecoin for BondManager (omit with --mock-yield)",
         "",
-        `Optional: LIQUIDITY_WALLET, INITIAL_SUPPLY, DEPLOYMENT_OUTPUT, EXPECTED_CHAIN_ID, MOCK_YIELD, POLYGONSCAN_API_KEY.`,
+        "Optional: LIQUIDITY_WALLET, INITIAL_SUPPLY, DEPLOYMENT_OUTPUT, EXPECTED_CHAIN_ID, MOCK_YIELD, LOCAL, FORCE, DRY_RUN, POLYGONSCAN_API_KEY.",
+        "",
+        "Tip: --local (or a localhost POLYGON_RPC_URL) runs against a local node and needs no PRIVATE_KEY.",
       ].join("\n")
     );
   }
@@ -448,39 +607,70 @@ async function main() {
   const liquidityWalletEnv = env.LIQUIDITY_WALLET ? ethers.getAddress(env.LIQUIDITY_WALLET) : null;
 
   /* ---------------------------------------------------------------------- */
-  /* 1. Signer                                                               */
+  /* 2. Provider + signer                                                   */
   /* ---------------------------------------------------------------------- */
 
-  const [deployer] = await ethers.getSigners();
-  if (!deployer) {
+  // The deployer key: the FIRST key of the comma-separated PRIVATE_KEY list —
+  // exactly the account hardhat.config.js uses as the first signer on the
+  // "polygon" network. In local mode a PRIVATE_KEY is optional and defaults
+  // to the well-known first account of a local hardhat node.
+  const privateKeyEnv = (process.env.PRIVATE_KEY || "").trim();
+  let privateKey;
+  let privateKeySource;
+  if (privateKeyEnv !== "") {
+    privateKey = privateKeyEnv.split(",")[0].trim();
+    privateKeySource = "PRIVATE_KEY[0]";
+  } else if (isLocalRun) {
+    privateKey = HARDHAT_DEFAULT_ACCOUNT_0_KEY;
+    privateKeySource = "hardhat node default account #0 (local dry-run default)";
+    warn(
+      "PRIVATE_KEY is not set: using the well-known first account of a local\n" +
+        "        hardhat node. This is ONLY safe against a local node — against a real\n" +
+        "        network PRIVATE_KEY is required and the script aborts without it."
+    );
+  } else {
+    // Unreachable for remote runs: PRIVATE_KEY is in requiredEnvNames and the
+    // collectRequiredEnv check above already aborted. Kept as a guard.
     fatal(
-      "No deployer signer available.",
-      `Network "${networkName}" exposes no accounts. hardhat.config.js reads PRIVATE_KEY from the environment for the "polygon" network.`
+      "PRIVATE_KEY is required for a non-local deployment.",
+      "Set PRIVATE_KEY in smart-contracts/.env (git-ignored) or export it in the shell."
     );
   }
+
+  if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) {
+    fatal(
+      `PRIVATE_KEY[0] is not a valid private key (expected 0x followed by 64 hex characters, got "${privateKey.slice(0, 12)}...").`,
+      "The first key of the comma-separated PRIVATE_KEY list is the deployer."
+    );
+  }
+
+  // cacheTimeout: -1 disables ethers' 250ms JSON-RPC response
+  // cache. With the default cache, two rapid transactions — the
+  // five deployments and the four allocation mints below are all
+  // sent back-to-back — can read a STALE eth_getTransactionCount
+  // (the previous transaction's receipt wait is shorter than the
+  // cache window) and fail with NONCE_EXPIRED on fast networks
+  // and local nodes. Uncached, every nonce query hits the wire,
+  // which is exactly what the hardhat-based path's in-process
+  // provider does.
+  const provider = new ethers.JsonRpcProvider(rpcUrl, undefined, {
+    cacheTimeout: -1,
+  });
+  const deployer = new ethers.Wallet(privateKey, provider);
   const deployerAddress = await deployer.getAddress();
 
-  if (marketingWallet === deployerAddress) {
-    warn(
-      "MARKETING_WALLET is the deployer. The 15,000,000 CATT marketing allocation will sit on the deployer\n" +
-        "        wallet rather than on a marketing wallet. That is only acceptable for a throwaway local run."
-    );
-  }
-  if (liquidityWalletEnv && marketingWallet === liquidityWalletEnv) {
-    warn(
-      "MARKETING_WALLET equals LIQUIDITY_WALLET, so the marketing and DEX liquidity buckets land in one wallet.\n" +
-        "        They are separate allocations and should have separate destinations."
-    );
-  }
+  // The signer is constructed FROM PRIVATE_KEY[0], so the deployer address is
+  // by construction the address of the first key in the list — the same
+  // account hardhat.config.js would use as the first signer on "polygon".
+  // (The hardhat-based script warned when the first signer differed from
+  // PRIVATE_KEY[0]; here that cannot happen by construction.)
 
-  if (!isLocalRun && deployerAddress.toLowerCase() !== String(env.PRIVATE_KEY || "").split(",")[0].trim().toLowerCase()) {
-    // Not fatal (multi-key lists are allowed); just tell the operator who is really signing.
-    warn(`the first signer on this network is ${deployerAddress}, which is not PRIVATE_KEY[0].`);
-  }
+  const liveChainId = BigInt((await provider.getNetwork()).chainId);
 
-  const balanceWei = await ethers.provider.getBalance(deployerAddress);
+  const balanceWei = await provider.getBalance(deployerAddress);
   banner("PRE-FLIGHT");
-  log(`deployer           : ${deployerAddress}`);
+  log(`network            : ${networkName} (chain id ${liveChainId})`);
+  log(`deployer           : ${deployerAddress}   (${privateKeySource})`);
   log(`deployer balance   : ${ethers.formatEther(balanceWei)} native token`);
   log(`backend signer     : ${signerAddress}   (MiningClaimer.signer)`);
   log(`team beneficiary   : ${teamBeneficiary}   (${formatCatt(teamAmount)} CATT, vested)`);
@@ -492,19 +682,18 @@ async function main() {
   if (balanceWei === 0n) {
     fatal(
       "The deployer account has no native token, so no deployment transaction can be sent.",
-      "Fund it with testnet MATIC (Amoy faucet) or run against the in-process network without --network."
+      "Fund it with testnet MATIC (Amoy faucet) or run with --local against a local node."
     );
   }
 
   if (isLocalRun) {
-    warn("running on the in-process Hardhat network: nothing is broadcast to any real chain.");
+    warn(`running against a LOCAL network (RPC: ${rpcUrl}): nothing is broadcast to any real chain.`);
   }
 
   /* ---------------------------------------------------------------------- */
-  /* 2. Chain id guard                                                       */
+  /* 3. Chain id guard                                                      */
   /* ---------------------------------------------------------------------- */
 
-  const liveChainId = BigInt(await ethers.provider.getNetwork().then((n) => n.chainId));
   const expectedChainId = process.env.EXPECTED_CHAIN_ID
     ? BigInt(String(process.env.EXPECTED_CHAIN_ID).trim())
     : DEFAULT_EXPECTED_CHAIN_ID;
@@ -525,7 +714,42 @@ async function main() {
   }
 
   /* ---------------------------------------------------------------------- */
-  /* 3. Yield token (real address from env, or the TEST-ONLY mock)           */
+  /* 4. Preload every committed artifact BEFORE the first transaction       */
+  /* ---------------------------------------------------------------------- */
+
+  // Fail fast — before any transaction is broadcast — if a committed
+  // artifact is missing or malformed. deployArtifact() below deploys
+  // from this map. Loaded here, before the yield-token deployment in
+  // the next section, so a bad checkout aborts before ANY transaction
+  // is sent.
+  const artifactKeys = mockYieldRequested
+    ? ["catt", "teamVesting", "stakingManager", "bondManager", "miningClaimer", "mockYield"]
+    : ["catt", "teamVesting", "stakingManager", "bondManager", "miningClaimer"];
+  const artifacts = {};
+  banner("ARTIFACTS (committed, no compilation)");
+  for (const key of artifactKeys) {
+    artifacts[key] = loadArtifact(key);
+    log(`  ${key.padEnd(16)}: ${ARTIFACT_FILES[key]}  (${artifacts[key].abi.length} ABI entries)`);
+  }
+
+  /**
+   * Deploys one contract from its committed artifact. This is the
+   * artifact-direct replacement for hardhat-ethers' `ethers.deployContract`:
+   * a plain ethers v6 ContractFactory over the committed ABI + bytecode,
+   * connected to the deployer. The artifacts have empty linkReferences, so
+   * no library-linking step is needed.
+   */
+  const deployArtifact = async (key, args) => {
+    const artifact = artifacts[key];
+    if (!artifact) {
+      fatal(`internal error: artifact "${key}" was not preloaded`);
+    }
+    const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, deployer);
+    return factory.deploy(...args);
+  };
+
+  /* ---------------------------------------------------------------------- */
+  /* 5. Yield token (real address from env, or the TEST-ONLY mock)          */
   /* ---------------------------------------------------------------------- */
 
   const txs = {};
@@ -534,7 +758,7 @@ async function main() {
   let yieldTokenKind;
   let yieldTokenNote;
   if (mockYieldRequested) {
-    const mock = await ethers.deployContract(ARTIFACT_NAMES.mockYield, [], deployer);
+    const mock = await deployArtifact("mockYield", []);
     const mockReceipt = await mock.deploymentTransaction().wait();
     txs.MockUSDT = mockReceipt.hash;
     yieldTokenAddress = await mock.getAddress();
@@ -564,7 +788,7 @@ async function main() {
   }
 
   /* ---------------------------------------------------------------------- */
-  /* 4. Output file guard (double-deployment protection)                     */
+  /* 6. Output file guard (double-deployment protection)                    */
   /* ---------------------------------------------------------------------- */
 
   const outputPath = path.resolve(
@@ -604,7 +828,7 @@ async function main() {
   }
 
   /* ---------------------------------------------------------------------- */
-    /* 5. DEPLOYMENT ORDER                                                    */
+  /* 7. DEPLOYMENT ORDER                                                    */
   /*                                                                       */
   /* ASSERTED, NOT ASSUMED: the order below is mandated by MiningClaimer's    */
   /* `DeploymentNotes` NatSpec header, steps (i)-(iv).                       */
@@ -624,7 +848,7 @@ async function main() {
   /* ---------------------------------------------------------------------- */
 
   banner("STEP 1/6 — CATT (deployer is the initial owner)");
-  const catt = await ethers.deployContract(ARTIFACT_NAMES.catt, [deployerAddress], deployer);
+  const catt = await deployArtifact("catt", [deployerAddress]);
   const cattReceipt = await catt.deploymentTransaction().wait();
   const cattAddress = await catt.getAddress();
   txs.CATT = cattReceipt.hash;
@@ -639,10 +863,9 @@ async function main() {
   }
 
   banner("STEP 2/6 — TeamVesting (team 15,000,000 + treasury 20,000,000)");
-  const teamVesting = await ethers.deployContract(
-    ARTIFACT_NAMES.teamVesting,
-    [cattAddress, teamBeneficiary, treasuryBeneficiary, teamAmount, treasuryAmount],
-    deployer
+  const teamVesting = await deployArtifact(
+    "teamVesting",
+    [cattAddress, teamBeneficiary, treasuryBeneficiary, teamAmount, treasuryAmount]
   );
   const vestingReceipt = await teamVesting.deploymentTransaction().wait();
   const teamVestingAddress = await teamVesting.getAddress();
@@ -652,7 +875,7 @@ async function main() {
   log(`  treasury           : ${treasuryBeneficiary} (${formatCatt(treasuryAmount)} CATT)`);
 
   banner("STEP 3/6 — StakingManager");
-  const stakingManager = await ethers.deployContract(ARTIFACT_NAMES.stakingManager, [cattAddress], deployer);
+  const stakingManager = await deployArtifact("stakingManager", [cattAddress]);
   const stakingReceipt = await stakingManager.deploymentTransaction().wait();
   const stakingManagerAddress = await stakingManager.getAddress();
   txs.StakingManager = stakingReceipt.hash;
@@ -666,7 +889,7 @@ async function main() {
         "address a yield claim could pay out of other users' locked principal."
     );
   }
-  const bondManager = await ethers.deployContract(ARTIFACT_NAMES.bondManager, [cattAddress, yieldTokenAddress], deployer);
+  const bondManager = await deployArtifact("bondManager", [cattAddress, yieldTokenAddress]);
   const bondReceipt = await bondManager.deploymentTransaction().wait();
   const bondManagerAddress = await bondManager.getAddress();
   txs.BondManager = bondReceipt.hash;
@@ -678,10 +901,9 @@ async function main() {
   }
 
   banner("STEP 5/6 — MiningClaimer");
-  const miningClaimer = await ethers.deployContract(
-    ARTIFACT_NAMES.miningClaimer,
-    [cattAddress, stakingManagerAddress, signerAddress],
-    deployer
+  const miningClaimer = await deployArtifact(
+    "miningClaimer",
+    [cattAddress, stakingManagerAddress, signerAddress]
   );
   const claimerReceipt = await miningClaimer.deploymentTransaction().wait();
   const miningClaimerAddress = await miningClaimer.getAddress();
@@ -692,7 +914,7 @@ async function main() {
   log(`  signer             : ${signerAddress}`);
 
   /* ---------------------------------------------------------------------- */
-  /* 6. WIRING                                                               */
+  /* 8. WIRING                                                              */
   /* ---------------------------------------------------------------------- */
 
   banner("STEP 6/6 — INITIAL ALLOCATION (deployer is STILL the CATT owner) — step (i)");
@@ -739,7 +961,7 @@ async function main() {
   log(`stakingManager.setClaimer(${miningClaimerAddress})   tx ${setClaimerTx.hash}`);
 
   /* ---------------------------------------------------------------------- */
-  /* 7. Verification                                                         */
+  /* 9. Verification                                                        */
   /* ---------------------------------------------------------------------- */
 
   banner("WIRING VERIFICATION");
@@ -856,7 +1078,7 @@ async function main() {
     checks[checks.length - 2].actual = "mint SUCCEEDED — deployer is still the owner";
     checks[checks.length - 2].ok = false;
   } catch (error) {
-    const revertName = (error.shortMessage || error.message || "").toString();
+    const revertName = describeRevert(error);
     checks[checks.length - 2].actual = `reverted: ${revertName}`;
     checks[checks.length - 2].ok = /OwnableUnauthorizedAccount|caller is not the owner/i.test(revertName);
   }
@@ -878,12 +1100,12 @@ async function main() {
   }
 
   /* ---------------------------------------------------------------------- */
-  /* 8. Manifest                                                            */
+  /* 10. Manifest                                                           */
   /* ---------------------------------------------------------------------- */
 
   const manifest = {
     generatedAt: new Date().toISOString(),
-    generator: "smart-contracts/scripts/deploy-testnet.js",
+    generator: "smart-contracts/scripts/deploy-testnet-standalone.js",
     network: {
       name: networkName,
       chainId: Number(liveChainId),
@@ -992,7 +1214,7 @@ async function main() {
   }
 
   /* ---------------------------------------------------------------------- */
-  /* 9. Summary table                                                       */
+  /* 11. Summary table                                                      */
   /* ---------------------------------------------------------------------- */
 
   const row = (label, value) => `  ${label.padEnd(24)}${value}`;
@@ -1061,17 +1283,18 @@ async function main() {
   log("");
 }
 
-async function entrypoint() {
-  // `npx hardhat run` has already compiled and already required this file, so
-  // `require.main !== module` there. Invoked directly with `node`, there is no
-  // compilation step yet, so run it first.
-  if (require.main === module) {
-    await hre.run("compile");
-  }
-  await main();
-}
+/* -------------------------------------------------------------------------- */
+/* Entrypoint                                                                 */
+/* -------------------------------------------------------------------------- */
 
-entrypoint().catch((error) => {
+// NOTE: there is deliberately NO compile step here — not even an optional
+// one. The compiled artifacts are committed to the repo (see ARTIFACT_FILES
+// above), and invoking hardhat's compile task is precisely what fails on
+// Termux/Android-ARM with Error HH18 at requireNapiRsModule. This script
+// must remain free of any require("hardhat") so the napi-rs Solidity
+// parser is never loaded.
+
+main().catch((error) => {
   console.error("");
   console.error("DEPLOYMENT FAILED:");
   console.error(error && error.stack ? error.stack : String(error));

@@ -18,10 +18,18 @@ This document describes how to run a pilot with 20–50 users on Polygon Amoy te
   - `LIQUIDITY_WALLET` — 10M CATT DEX liquidity (optional, defaults to deployer)
   - `YIELD_TOKEN_ADDRESS` — Real stablecoin for BondManager (or use `MOCK_YIELD=true`)
 
-Run:
+Run (laptop/CI with a working hardhat toolchain):
 ```bash
 cd smart-contracts
 npx hardhat run scripts/deploy-testnet.js --network polygon
+```
+
+Run (Termux/Android-ARM — no hardhat; deploys from the committed
+artifacts with plain ethers v6, because hardhat's Solidity parser
+has no Android build and fails with Error HH18):
+```bash
+cd smart-contracts
+node scripts/deploy-testnet-standalone.js
 ```
 Output: `deployed-testnet.json` (do NOT commit).
 
@@ -163,7 +171,7 @@ If ANY criterion fails, extend pilot, investigate, and re-evaluate.
 
 | Task | Command |
 |------|---------|
-| Deploy contracts (Amoy) | `cd smart-contracts && npx hardhat run scripts/deploy-testnet.js --network polygon` |
+| Deploy contracts (Amoy) | `cd smart-contracts && node scripts/deploy-testnet-standalone.js` (phone) or `cd smart-contracts && npx hardhat run scripts/deploy-testnet.js --network polygon` (laptop/CI) |
 | Start backend | `cd backend-server && npm start` |
 | Build release APK | `cd mobile-app && flutter build apk --release --dart-define=...` |
 | Weekly report | `CATT_STORE=sqlite SQLITE_PATH=/var/lib/catt-judge/judge.db node scripts/pilot-report.js` |
